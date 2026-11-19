@@ -76,7 +76,10 @@ The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.
 | Item | Status |
 |---|---|
 | R1 | supported the existing PR ROCm/rocm-systems#13903 with test data; ROCm 10.2 does not contain the fix yet |
-| R1b, R2, R3, R4 | not submitted |
+| R1 + R1b | PR ROCm/rocm-systems#16218 |
+| R4 | PR ROCm/rocm-libraries#16348 |
+| R2 | PR ROCm/rocm-libraries#16349 |
+| R3 | PR ROCm/rocm-libraries#16350 |
 | K (kernel) | not submitted (needs a human submitter with Signed-off-by per kernel rules) |
 | C, Vulkan | not submitted (llama.cpp does not accept AI-written PRs/issues) |
 
