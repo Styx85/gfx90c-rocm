@@ -1,0 +1,35 @@
+From 069b710afa7cdc6b3d331096d20916b9b2bf7831 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:15:18 +0100
+Subject: [PATCH 03/11] HIP: use the gfx900 dp4a asm sequence also for
+ gfx909/gfx90c
+
+gfx909 and gfx90c share the gfx900 ISA (no dot instructions) but fell through
+to the generic C++ dp4a fallback. clang emits similar instructions, but the
+register allocation of the MMQ kernels is much worse: on gfx90c
+mul_mat_q<Q4_K, 64> spilled 431 VGPRs (912 B scratch per lane), mmq_x 32 290.
+With the asm sequence: 30 resp. 0 spilled VGPRs.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 17e1bd3..9fc0d0f 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -765,7 +765,9 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
+     c = __builtin_amdgcn_sdot4(a, b, c, false);
+ #elif defined(RDNA3) || defined(RDNA4_M) || defined(RDNA4)
+     c = __builtin_amdgcn_sudot4( true, a, true, b, c, false);
+-#elif defined(RDNA1) || defined(__gfx900__)
++#elif defined(RDNA1) || defined(__gfx900__) || defined(__gfx909__) || defined(__gfx90c__)
++    // gfx909/gfx90c have the gfx900 ISA. Besides being explicit, the asm block keeps register pressure in
++    // check: with the generic C++ fallback the MMQ kernels spill hundreds of VGPRs on these GPUs.
+     int tmp1;
+     int tmp2;
+     asm("\n \
+-- 
+2.56.1
+

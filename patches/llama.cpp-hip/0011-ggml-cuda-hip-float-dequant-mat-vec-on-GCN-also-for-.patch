@@ -1,0 +1,228 @@
+From fe58430e6266ebf9d0f732312abc167c75da0135 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:37:11 +0100
+Subject: [PATCH 11/11] ggml-cuda: hip: float dequant mat-vec on GCN also for
+ Q4_0, Q5_0 and Q8_0
+
+GCN without dot instructions (gfx900/gfx90c) runs the integer mmvq path
+with an emulated dp4a and needs a q8_1 copy of src1. The float
+mat-vec kernel added for Q4_K/Q6_K is faster there; extend it to the
+legacy 32-element block types with a 128-element chunk (4 blocks, one
+quarter block per thread), so rows only need to be a multiple of 128.
+Signed Q8_0 bytes are converted via (q ^ 0x80) - 128 to keep the
+unsigned byte-to-float conversions.
+
+Models with dimensions that are not a multiple of 256 (e.g. gemma-3-1b,
+1152) fall back to Q5_0/Q8_0 for many tensors even in Q4_K_M files.
+
+gfx90c, gemma-3-1b-it Q4_K_M, tg128 interleaved (4 rounds): 40.4-40.8 ->
+46.7-46.8 t/s (Vulkan on the same GPU: 45.2-45.3). test-backend-ops
+MUL_MAT 2688/2688, MUL_MAT_FUSION 1602/1602; perplexity with -ub 1
+11.7586 -> 11.7297 (src1 no longer quantized to q8_1).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 134 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 123 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 7745b7a..f737853 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1480,6 +1480,8 @@ template <ggml_type type> struct ggml_gcn_fmmv;
+ 
+ template <> struct ggml_gcn_fmmv<GGML_TYPE_Q4_K> {
+     typedef block_q4_K block_t;
++    static constexpr int chunk = QK_K; // elements per 16-thread group and loop step
++    static constexpr int bpc   = 1;    // blocks per chunk
+     int v_im, q_offset, y_offset;
+     float4 y10, y132, y20, y232;
+     float  s10, s132, s20, s232;
+@@ -1535,6 +1537,8 @@ template <> struct ggml_gcn_fmmv<GGML_TYPE_Q4_K> {
+ 
+ template <> struct ggml_gcn_fmmv<GGML_TYPE_Q6_K> {
+     typedef block_q6_K block_t;
++    static constexpr int chunk = QK_K;
++    static constexpr int bpc   = 1;
+     int ql_offset, qh_offset, s_offset, y_offset;
+     float4 y0, y32, y64, y96;
+     float  s0, s32, s64, s96;
+@@ -1588,6 +1592,98 @@ template <> struct ggml_gcn_fmmv<GGML_TYPE_Q6_K> {
+     }
+ };
+ 
++// Legacy 32-element blocks: a chunk is 128 elements (4 blocks), each of the 16 threads of a group owns a quarter block.
++// The 2-byte aligned blocks are read as 16-bit halves.
++static __device__ __forceinline__ uint32_t ggml_gcn_load_u32_a2(const uint8_t * p) {
++    const uint16_t * p16 = (const uint16_t *) p;
++    return uint32_t(p16[0]) | (uint32_t(p16[1]) << 16);
++}
++
++// spread the low 4 bits of h into bit 4 of the 4 bytes
++static __device__ __forceinline__ uint32_t ggml_gcn_spread4_bit4(const uint32_t h) {
++    return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
++}
++
++template <> struct ggml_gcn_fmmv<GGML_TYPE_Q4_0> {
++    typedef block_q4_0 block_t;
++    static constexpr int chunk = 128;
++    static constexpr int bpc   = 4;
++    int b_offset, q;
++    float4 ylo, yhi;
++    float  s;
++
++    __device__ __forceinline__ ggml_gcn_fmmv(const int itid) : b_offset(itid / 4), q(itid % 4) {}
++
++    __device__ __forceinline__ void load_y(const float * __restrict__ yb) {
++        yb += 32*b_offset + 4*q;
++        ylo = *(const float4 *) (yb +  0);
++        yhi = *(const float4 *) (yb + 16);
++        s   = ggml_gcn_sum4(ylo) + ggml_gcn_sum4(yhi);
++    }
++
++    __device__ __forceinline__ float dot(const block_t * __restrict__ b) const {
++        b += b_offset;
++        const uint32_t qs = ggml_gcn_load_u32_a2(b->qs + 4*q);
++        const float sum = ggml_gcn_dot4_u8(qs & 0x0F0F0F0Fu, ylo) + ggml_gcn_dot4_u8((qs >> 4) & 0x0F0F0F0Fu, yhi);
++        return __half2float(b->d)*(sum - 8.0f*s);
++    }
++};
++
++template <> struct ggml_gcn_fmmv<GGML_TYPE_Q5_0> {
++    typedef block_q5_0 block_t;
++    static constexpr int chunk = 128;
++    static constexpr int bpc   = 4;
++    int b_offset, q;
++    float4 ylo, yhi;
++    float  s;
++
++    __device__ __forceinline__ ggml_gcn_fmmv(const int itid) : b_offset(itid / 4), q(itid % 4) {}
++
++    __device__ __forceinline__ void load_y(const float * __restrict__ yb) {
++        yb += 32*b_offset + 4*q;
++        ylo = *(const float4 *) (yb +  0);
++        yhi = *(const float4 *) (yb + 16);
++        s   = ggml_gcn_sum4(ylo) + ggml_gcn_sum4(yhi);
++    }
++
++    __device__ __forceinline__ float dot(const block_t * __restrict__ b) const {
++        b += b_offset;
++        const uint32_t qs = ggml_gcn_load_u32_a2(b->qs + 4*q);
++        const uint32_t qh = ggml_gcn_load_u32_a2(b->qh);
++        const uint32_t lo = ( qs       & 0x0F0F0F0Fu) | ggml_gcn_spread4_bit4(qh >> (4*q));
++        const uint32_t hi = ((qs >> 4) & 0x0F0F0F0Fu) | ggml_gcn_spread4_bit4(qh >> (4*q + 16));
++        const float sum = ggml_gcn_dot4_u8(lo, ylo) + ggml_gcn_dot4_u8(hi, yhi);
++        return __half2float(b->d)*(sum - 16.0f*s);
++    }
++};
++
++template <> struct ggml_gcn_fmmv<GGML_TYPE_Q8_0> {
++    typedef block_q8_0 block_t;
++    static constexpr int chunk = 128;
++    static constexpr int bpc   = 4;
++    int b_offset, q;
++    float4 y0, y1;
++    float  s;
++
++    __device__ __forceinline__ ggml_gcn_fmmv(const int itid) : b_offset(itid / 4), q(itid % 4) {}
++
++    __device__ __forceinline__ void load_y(const float * __restrict__ yb) {
++        yb += 32*b_offset + 8*q;
++        y0 = *(const float4 *) (yb + 0);
++        y1 = *(const float4 *) (yb + 4);
++        s  = ggml_gcn_sum4(y0) + ggml_gcn_sum4(y1);
++    }
++
++    __device__ __forceinline__ float dot(const block_t * __restrict__ b) const {
++        b += b_offset;
++        // signed bytes: q = (q ^ 0x80) - 128, so the unsigned byte conversions can be used
++        const uint32_t q0 = ggml_gcn_load_u32_a2((const uint8_t *) b->qs + 8*q + 0) ^ 0x80808080u;
++        const uint32_t q1 = ggml_gcn_load_u32_a2((const uint8_t *) b->qs + 8*q + 4) ^ 0x80808080u;
++        const float sum = ggml_gcn_dot4_u8(q0, y0) + ggml_gcn_dot4_u8(q1, y1);
++        return __half2float(b->d)*(sum - 128.0f*s);
++    }
++};
++
+ template <ggml_type type, int nrows_wg, bool has_fusion, bool has_gate>
+ __launch_bounds__(64, 1)
+ static __global__ void mul_mat_vec_f32_gcn(
+@@ -1601,7 +1697,9 @@ static __global__ void mul_mat_vec_f32_gcn(
+     const int tid  = threadIdx.x;
+     const int ix   = tid / 16;
+     const int row0 = blockIdx.x*nrows_wg;
+-    const int nb   = ncols / QK_K;
++    constexpr int chunk = ggml_gcn_fmmv<type>::chunk;
++    constexpr int bpc   = ggml_gcn_fmmv<type>::bpc;
++    const int nb   = ncols / chunk;
+ 
+     ggml_gcn_fmmv<type> f(tid % 16);
+ 
+@@ -1609,10 +1707,10 @@ static __global__ void mul_mat_vec_f32_gcn(
+     float accg[nrows_wg] = {0.0f};
+ 
+     for (int i = ix; i < nb; i += 4) {
+-        f.load_y(y + i*QK_K);
++        f.load_y(y + i*chunk);
+ #pragma unroll
+         for (int n = 0; n < nrows_wg; ++n) {
+-            const int64_t offs = (int64_t) min(row0 + n, nrows - 1)*stride_row + i;
++            const int64_t offs = (int64_t) min(row0 + n, nrows - 1)*stride_row + i*bpc;
+             acc[n] += f.dot((const block_t *) vx + offs);
+             if constexpr (use_gate) {
+                 accg[n] += f.dot((const block_t *) vgate + offs);
+@@ -1671,15 +1769,17 @@ static __global__ void mul_mat_vec_f32_gcn(
+ // 0 = disabled, otherwise rows per 64-thread block (1, 2 or 4).
+ // Defaults on GCN: 4 rows (Q4_K), 2 rows for Q6_K and with a fused gate (twice the registers);
+ // override with GGML_HIP_GCN_FMMV(_GATE).
+-// GGML_HIP_GCN_FMMV_TYPES: bit 0 = Q4_K, bit 1 = Q6_K (default 3).
++// GGML_HIP_GCN_FMMV_TYPES: bit 0 = Q4_K, bit 1 = Q6_K, bit 2 = Q4_0, bit 3 = Q5_0, bit 4 = Q8_0 (default 31).
+ static int ggml_cuda_gcn_fmmv_rows(const int cc, const ggml_type type, const bool gate) {
+     static const int env       = [] { const char * s = getenv("GGML_HIP_GCN_FMMV");       return s ? atoi(s) : -1; }();
+     static const int env_gate  = [] { const char * s = getenv("GGML_HIP_GCN_FMMV_GATE");  return s ? atoi(s) : -1; }();
+-    static const int env_types = [] { const char * s = getenv("GGML_HIP_GCN_FMMV_TYPES"); return s ? atoi(s) : 3; }();
++    static const int env_types = [] { const char * s = getenv("GGML_HIP_GCN_FMMV_TYPES"); return s ? atoi(s) : 31; }();
+     if (!GGML_CUDA_CC_IS_GCN(cc) || env == 0) {
+         return 0;
+     }
+-    if (!((type == GGML_TYPE_Q4_K && (env_types & 1)) || (type == GGML_TYPE_Q6_K && (env_types & 2)))) {
++    const int type_bit = type == GGML_TYPE_Q4_K ? 1 : type == GGML_TYPE_Q6_K ? 2 : type == GGML_TYPE_Q4_0 ? 4 :
++                         type == GGML_TYPE_Q5_0 ? 8 : type == GGML_TYPE_Q8_0 ? 16 : 0;
++    if (!(env_types & type_bit)) {
+         return 0;
+     }
+     const int e = gate ? env_gate : env;
+@@ -1829,14 +1929,26 @@ void ggml_cuda_mul_mat_vec_q(
+         const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         const int fmmv_rows = ggml_cuda_gcn_fmmv_rows(cc, src0->type, fusion_local.gate != nullptr);
+         if (fmmv_rows > 0 && !ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+-                ne02 == 1 && ne03 == 1 && ne00 % QK_K == 0 && ggml_is_contiguous(src1) &&
++                ne02 == 1 && ne03 == 1 && ne00 % (ggml_blck_size(src0->type) == QK_K ? QK_K : 128) == 0 && ggml_is_contiguous(src1) &&
+                 fusion_local.shared_up == nullptr && fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr) {
+             const int  stride_row = src0->nb[1] / ts_src0;
+             const bool has_fusion = fusion != nullptr;
+-            if (src0->type == GGML_TYPE_Q4_K) {
+-                mul_mat_vec_f32_gcn_switch_rows<GGML_TYPE_Q4_K>(fmmv_rows, src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
+-            } else {
+-                mul_mat_vec_f32_gcn_switch_rows<GGML_TYPE_Q6_K>(fmmv_rows, src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++            switch (src0->type) {
++                case GGML_TYPE_Q4_K:
++                    mul_mat_vec_f32_gcn_switch_rows<GGML_TYPE_Q4_K>(fmmv_rows, src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
++                case GGML_TYPE_Q6_K:
++                    mul_mat_vec_f32_gcn_switch_rows<GGML_TYPE_Q6_K>(fmmv_rows, src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
++                case GGML_TYPE_Q4_0:
++                    mul_mat_vec_f32_gcn_switch_rows<GGML_TYPE_Q4_0>(fmmv_rows, src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
++                case GGML_TYPE_Q5_0:
++                    mul_mat_vec_f32_gcn_switch_rows<GGML_TYPE_Q5_0>(fmmv_rows, src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
++                default:
++                    mul_mat_vec_f32_gcn_switch_rows<GGML_TYPE_Q8_0>(fmmv_rows, src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
+             }
+             CUDA_CHECK(cudaGetLastError());
+             return;
+-- 
+2.56.1
+

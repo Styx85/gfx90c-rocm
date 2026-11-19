@@ -1,0 +1,128 @@
+From 02a1a5968501e3ad198cc2bcae45662c66dec4b3 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:18:44 +0100
+Subject: [PATCH 10/11] ggml-cuda: hip: one rope pair per thread in
+ rms_norm_mul_rope on GCN for 128-wide rows
+
+On GCN the fused RMS_NORM+MUL+ROPE(+SET_ROWS) kernel for per-head q/k
+norms (128 columns, one 64-wide wave per row) is a short latency chain
+in decode: load x, reduce, load mul/pos, compute rope, store.
+
+With exactly one rope pair per thread, issue all loads (x pair, mul,
+pos, freq factor) before the reduction. Only used for ncols == 128 on
+GCN; the math is unchanged (sincosf).
+
+gfx90c, Qwen3-0.6B Q4_K_M, tg128 interleaved (4 rounds): 81.8-83.0 ->
+83.5-84.2 t/s (+1.5 %). test-backend-ops RMS_NORM_MUL_ROPE 281/281,
+ROPE 490/490, perplexity unchanged (10.5621).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/rope.cu | 77 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 07ed329..5bf94cc 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -725,7 +725,9 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
+ 
+ // fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
+ // one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns
+-template <int block_size, bool has_ff, typename D>
++// pair_per_thread: ncols == 2*block_size, every thread owns exactly one rope pair. All loads are issued before the
++// reduction, which shortens the latency chain of the tiny decode launches (GCN).
++template <int block_size, bool has_ff, typename D, bool pair_per_thread = false>
+ static __global__ void rms_norm_mul_rope_f32(
+         const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
+         const int64_t s01, const int64_t s02, const int64_t s03,
+@@ -759,6 +761,61 @@ static __global__ void rms_norm_mul_rope_f32(
+             const uint32_t mul_sample  = fastmodulo(sample,  mul_nsamples_packed);
+             const float * mulc = mul + mul_sample*mul_s03 + mul_channel*mul_s02 + mul_row*mul_s01;
+ 
++            if constexpr (pair_per_thread) {
++                const int i0 = 2*tid;
++                int ix0;
++                int ix1;
++                if (is_neox && i0 < n_dims) {
++                    ix0 = i0/2;
++                    ix1 = i0/2 + n_dims/2;
++                } else {
++                    ix0 = i0 + 0;
++                    ix1 = i0 + 1;
++                }
++                const float xa = xc[ix0];
++                const float xb = xc[ix1];
++                const float ma = mulc[fastmodulo(ix0, mul_ncols_packed)];
++                const float mb = mulc[fastmodulo(ix1, mul_ncols_packed)];
++                const float p  = pos[channel];
++                const float ff = has_ff && i0 < n_dims ? freq_factors[i0/2] : 1.0f;
++
++                const float sum   = block_reduce<block_reduce_method::SUM, block_size>(xa*xa + xb*xb, s_sum);
++                const float scale = rsqrtf(sum/ncols + eps);
++
++                int64_t idst = sample*s3 + channel*s2 + row*s1;
++                if (set_rows_stride != 0) {
++                    idst = row*s1 + row_indices[channel]*set_rows_stride;
++                }
++                D * dstc = dst + idst;
++
++                const float x0 = scale * xa * ma;
++                const float x1 = scale * xb * mb;
++                if (i0 >= n_dims) {
++                    dstc[ix0] = ggml_cuda_cast<D>(x0);
++                    dstc[ix1] = ggml_cuda_cast<D>(x1);
++                } else {
++                    const float theta_extrap = p*powf(theta_scale, i0/2.0f)/ff;
++                    float theta  = freq_scale*theta_extrap;
++                    float mscale = attn_factor;
++                    if (ext_factor != 0.0f) {
++                        const float ramp_mix = rope_yarn_ramp(corr_dims.v[0], corr_dims.v[1], i0) * ext_factor;
++                        theta   = theta*(1 - ramp_mix) + theta_extrap*ramp_mix;
++                        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
++                    }
++                    float sin_theta;
++                    float cos_theta;
++                    sincosf(theta, &sin_theta, &cos_theta);
++                    sin_theta *= mscale;
++                    cos_theta *= mscale;
++                    dstc[ix0] = ggml_cuda_cast<D>(x0*cos_theta - x1*sin_theta);
++                    dstc[ix1] = ggml_cuda_cast<D>(x0*sin_theta + x1*cos_theta);
++                }
++                if constexpr (block_size > WARP_SIZE) {
++                    __syncthreads();
++                }
++                continue;
++            }
++
+             float tmp = 0.0f;
+ 
+             for (int col = tid; col < ncols; col += block_size) {
+@@ -846,7 +903,23 @@ static void rms_norm_mul_rope_cuda(
+     // GCN: rows of up to 128 columns (per-head q/k norm) fit one 64-wide wave: no shared memory reduction or
+     // barrier and no idle half block. Measured on gfx90c: 2.5x lower kernel time in prompt processing.
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-    if (ncols <= 128 && GGML_CUDA_CC_IS_GCN(cc)) {
++    if (ncols == 128 && GGML_CUDA_CC_IS_GCN(cc)) {
++        const dim3 block_dims(64, 1, 1);
++        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
++        if (freq_factors == nullptr) {
++            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<64, false, D, true>, launch_params,
++                x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
++                freq_factors, row_indices, set_rows_stride, is_neox);
++        } else {
++            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<64, true, D, true>, launch_params,
++                x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
++                freq_factors, row_indices, set_rows_stride, is_neox);
++        }
++    } else if (ncols < 128 && GGML_CUDA_CC_IS_GCN(cc)) {
+         const dim3 block_dims(64, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
+         if (freq_factors == nullptr) {
+-- 
+2.56.1
+

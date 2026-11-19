@@ -1,0 +1,51 @@
+From 367eba72fd2f6149adf6f9d2c856a3b92df4cfc5 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 02:43:16 +0100
+Subject: [PATCH 06/11] ggml-cuda: hip: rms_norm_mul_rope with one 64-wide
+ block for rows <= 128 on GCN
+
+On GCN the fused rms_norm + mul + rope kernel for per-head q/k norm (head size 128) ran with 256-thread
+blocks, leaving half of the block idle and paying a shared memory reduction plus barrier per row. One
+64-wide wave covers the row: on gfx90c the kernel time in prompt processing drops 2.5x (933 -> 376 us
+and 509 -> 215 us per call for Qwen3 0.6B, pp512), pp512 +6%; token generation unchanged.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/rope.cu | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 2604d01..07ed329 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -843,7 +843,26 @@ static void rms_norm_mul_rope_cuda(
+     const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+     const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+ 
+-    if (ncols < 1024) {
++    // GCN: rows of up to 128 columns (per-head q/k norm) fit one 64-wide wave: no shared memory reduction or
++    // barrier and no idle half block. Measured on gfx90c: 2.5x lower kernel time in prompt processing.
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (ncols <= 128 && GGML_CUDA_CC_IS_GCN(cc)) {
++        const dim3 block_dims(64, 1, 1);
++        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
++        if (freq_factors == nullptr) {
++            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<64, false, D>, launch_params,
++                x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
++                freq_factors, row_indices, set_rows_stride, is_neox);
++        } else {
++            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<64, true, D>, launch_params,
++                x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
++                freq_factors, row_indices, set_rows_stride, is_neox);
++        }
++    } else if (ncols < 1024) {
+         const dim3 block_dims(256, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
+         if (freq_factors == nullptr) {
+-- 
+2.56.1
+

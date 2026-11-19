@@ -1,0 +1,97 @@
+From fbfc910fcddc5077a1ac75122a60402398d1be87 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:04:50 +0100
+Subject: [PATCH 1/2] clr: sync gfx9 client APU ISA entries with ROCr (xnack
+ unsupported)
+
+ROCr commit 688f2235a4 ("Disable XNACK for gfx9 client APUs
+(gfx902/gfx909/gfx90c)") marks XNACK as unsupported for these targets,
+so the agent reports the neutral ISA name, e.g. amdgcn-amd-amdhsa--gfx90c.
+The ISA table in rocclr was not updated and still lists these targets
+with XNACK any/off/on. The agent ISA therefore resolves to an entry with
+xnack == Any, and Isa::isCompatible() trips its assertion
+
+  codeObjectIsa.isXnackSupported() == agentIsa.isXnackSupported() &&
+  agentIsa.xnack() != Feature::Any
+
+for every code object (gfx90c, gfx90c:xnack-, gfx90c:xnack+,
+gfx9-generic). Without assertions the check silently returns true.
+
+- Mark XNACK as unsupported for gfx902/gfx909/gfx90c, keep the
+  ":xnack-" names so xnack-off code objects still resolve, drop
+  ":xnack+" like ROCr does.
+- In isCompatible(), allow code objects of an XNACK-capable generic
+  target (gfx9-generic) on an agent without XNACK unless they require
+  xnack+.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ projects/clr/rocclr/device/device.cpp | 31 +++++++++++++++++----------
+ 1 file changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/projects/clr/rocclr/device/device.cpp b/projects/clr/rocclr/device/device.cpp
+index 7ec7485976..5e0ebd6ba1 100644
+--- a/projects/clr/rocclr/device/device.cpp
++++ b/projects/clr/rocclr/device/device.cpp
+@@ -118,9 +118,12 @@ std::pair<const Isa*, const Isa*> Isa::supportedIsas() {
+       {"gfx900", true, true, 9, 0, 0, NONE, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx900:xnack-", true, true, 9, 0, 0, NONE, OFF, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx900:xnack+", true, true, 9, 0, 0, NONE, ON, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx902", true, true, 9, 0, 2, NONE, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx902:xnack-", true, true, 9, 0, 2, NONE, OFF, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx902:xnack+", true, true, 9, 0, 2, NONE, ON, 4, 16, 1, 256, 64 * Ki, 32, 512},
++      // gfx9 client APUs (gfx902/gfx909/gfx90c): ROCr reports XNACK as unsupported for
++      // these targets (xnack-off mode, see rocr isa.cpp). Keep this table in sync with
++      // ROCr, otherwise the agent ISA resolves to an XNACK "any" entry. The ":xnack-"
++      // entries are kept so that xnack-off code objects can still be loaded.
++      {"gfx902", true, true, 9, 0, 2, NONE, NONE, 4, 16, 1, 256, 64 * Ki, 32, 512},
++      {"gfx902:xnack-", true, true, 9, 0, 2, NONE, NONE, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx904", true, true, 9, 0, 4, NONE, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx904:xnack-", true, true, 9, 0, 4, NONE, OFF, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx904:xnack+", true, true, 9, 0, 4, NONE, ON, 4, 16, 1, 256, 64 * Ki, 32, 512},
+@@ -147,9 +150,8 @@ std::pair<const Isa*, const Isa*> Isa::supportedIsas() {
+       {"gfx908:sramecc+:xnack-", true, false, 9, 0, 8, ON, OFF, 4, 16, 1, 256, 64 * Ki,
+        32, 512},
+       {"gfx908:sramecc+:xnack+", true, false, 9, 0, 8, ON, ON, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx909", false, true, 9, 0, 2, NONE, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx909:xnack-", false, true, 9, 0, 2, NONE, OFF, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx909:xnack+", false, true, 9, 0, 2, NONE, ON, 4, 16, 1, 256, 64 * Ki, 32, 512},
++      {"gfx909", false, true, 9, 0, 2, NONE, NONE, 4, 16, 1, 256, 64 * Ki, 32, 512},
++      {"gfx909:xnack-", false, true, 9, 0, 2, NONE, NONE, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx90a", true, false, 9, 0, 10, ANY, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx90a:sramecc-", true, false, 9, 0, 10, OFF, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx90a:sramecc+", true, false, 9, 0, 10, ON, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+@@ -175,9 +177,8 @@ std::pair<const Isa*, const Isa*> Isa::supportedIsas() {
+       {"gfx942:sramecc+:xnack-", true, false, 9, 4, 2, ON, OFF, 4, 16, 1, 256, 64 * Ki,
+        32, 512},
+       {"gfx942:sramecc+:xnack+", true, false, 9, 4, 2, ON, ON, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx90c", true, true, 9, 0, 12, NONE, ANY, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx90c:xnack-", true, true, 9, 0, 12, NONE, OFF, 4, 16, 1, 256, 64 * Ki, 32, 512},
+-      {"gfx90c:xnack+", true, true, 9, 0, 12, NONE, ON, 4, 16, 1, 256, 64 * Ki, 32, 512},
++      {"gfx90c", true, true, 9, 0, 12, NONE, NONE, 4, 16, 1, 256, 64 * Ki, 32, 512},
++      {"gfx90c:xnack-", true, true, 9, 0, 12, NONE, NONE, 4, 16, 1, 256, 64 * Ki, 32, 512},
+       {"gfx950", true, false, 9, 5, 0, ANY, ANY, 4, 16, 1, 256, 160 * Ki, 64, 1280},
+       {"gfx950:sramecc-", true, false, 9, 5, 0, OFF, ANY, 4, 16, 1, 256, 160 * Ki, 64, 1280},
+       {"gfx950:sramecc+", true, false, 9, 5, 0, ON, ANY, 4, 16, 1, 256, 160 * Ki, 64, 1280},
+@@ -293,8 +294,16 @@ bool Isa::isCompatible(const Isa& codeObjectIsa, const Isa& agentIsa) {
+       codeObjectIsa.sramecc() != agentIsa.sramecc())
+     return false;
+ 
+-  assert(codeObjectIsa.isXnackSupported() == agentIsa.isXnackSupported() &&
+-         agentIsa.xnack() != Feature::Any);
++  if (!agentIsa.isXnackSupported()) {
++    // The agent runs without XNACK (e.g. gfx9 client APUs, which ROCr reports as xnack-off).
++    // Code objects for an XNACK-capable generic target (e.g. gfx9-generic) are fine as long
++    // as they do not require XNACK.
++    assert(isGeneric || !codeObjectIsa.isXnackSupported());
++    if (codeObjectIsa.xnack() == Feature::Enabled) return false;
++    return true;
++  }
++
++  assert(codeObjectIsa.isXnackSupported() && agentIsa.xnack() != Feature::Any);
+   if ((codeObjectIsa.xnack() == Feature::Enabled || codeObjectIsa.xnack() == Feature::Disabled) &&
+       codeObjectIsa.xnack() != agentIsa.xnack())
+     return false;
+-- 
+2.56.1
+

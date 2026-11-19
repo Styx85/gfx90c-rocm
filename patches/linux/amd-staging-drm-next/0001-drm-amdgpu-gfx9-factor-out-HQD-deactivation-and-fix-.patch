@@ -1,0 +1,95 @@
+From 7bf4f341a45ebcaded4b5140d80458cb8842ee1d Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:51:15 +0100
+Subject: [PATCH 1/2] drm/amdgpu/gfx9: factor out HQD deactivation and fix its
+ timeout check
+
+gfx_v9_0_deactivate_kcq_hqd() polls CP_HQD_ACTIVE for adev->usec_timeout
+iterations, but then compares the loop counter against
+AMDGPU_MAX_USEC_TIMEOUT. Unless both values happen to be equal, the
+manual CP_HQD_ACTIVE=0 fallback for a timed-out dequeue request is never
+reached. Compare against the actual loop bound.
+
+Move the per-queue deactivation into gfx_v9_0_deactivate_hqd() so it can
+be reused for queues that are not kernel compute rings, and use
+dev_dbg() instead of DRM_DEBUG() while at it. No functional change other
+than the timeout check.
+
+Fixes: c3988a7ad479 ("drm/amdgpu/gfx9: Fix Ring and IB test fail after mode2")
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c | 50 ++++++++++++++++-----------
+ 1 file changed, 29 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 9d87ebb..b60b6fa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -4076,35 +4076,43 @@ err_priv_inst:
+ 	return r;
+ }
+ 
++/* caller must hold srbm_mutex and have selected me/pipe/queue */
++static bool gfx_v9_0_deactivate_hqd(struct amdgpu_device *adev,
++				    u32 me, u32 pipe, u32 queue)
++{
++	int j;
++
++	/* disable the queue if it's active */
++	if (!(RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE) & CP_HQD_ACTIVE__ACTIVE_MASK))
++		return false;
++
++	WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 1);
++	for (j = 0; j < adev->usec_timeout; j++) {
++		if (!(RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE) &
++		      CP_HQD_ACTIVE__ACTIVE_MASK))
++			break;
++		udelay(1);
++	}
++	if (j == adev->usec_timeout) {
++		dev_dbg(adev->dev, "comp_%u_%u_%u dequeue request failed.\n",
++			me, pipe, queue);
++		/* Manual disable if dequeue request times out */
++		WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
++	}
++	WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 0);
++
++	return true;
++}
++
+ static void gfx_v9_0_deactivate_kcq_hqd(struct amdgpu_device *adev)
+ {
+ 	amdgpu_gfx_rlc_enter_safe_mode(adev, 0);
+ 	for (int i = 0; i < adev->gfx.num_compute_rings; i++) {
+-		u32 tmp;
+ 		struct amdgpu_ring *ring = &adev->gfx.compute_ring[i];
+ 
+ 		mutex_lock(&adev->srbm_mutex);
+ 		soc15_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0, 0);
+-		tmp = RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE);
+-		/* disable the queue if it's active */
+-		if (tmp & CP_HQD_ACTIVE__ACTIVE_MASK) {
+-			int j;
+-
+-			WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 1);
+-			for (j = 0; j < adev->usec_timeout; j++) {
+-				tmp = RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE);
+-				if (!(tmp & CP_HQD_ACTIVE__ACTIVE_MASK))
+-					break;
+-				udelay(1);
+-			}
+-			if (j == AMDGPU_MAX_USEC_TIMEOUT) {
+-				DRM_DEBUG("comp_%u_%u_%u dequeue request failed.\n",
+-							ring->me, ring->pipe, ring->queue);
+-				/* Manual disable if dequeue request times out */
+-				WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
+-			}
+-			WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 0);
+-		}
++		gfx_v9_0_deactivate_hqd(adev, ring->me, ring->pipe, ring->queue);
+ 		soc15_grbm_select(adev, 0, 0, 0, 0, 0);
+ 		mutex_unlock(&adev->srbm_mutex);
+ 	}
+-- 
+2.56.1
+

@@ -1,0 +1,33 @@
+From 36fa8b5aaab874e35c23be917ddeb592fc815602 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:54:14 +0100
+Subject: [PATCH 01/11] CUDA/HIP: mmvq use one warp per row for ncols_dst=1 on
+ GCN
+
+On gfx90c (Vega iGPU, 7 CUs, wave64) token generation with Qwen3 0.6B Q4
+improves from 56 to 69.8 t/s (1.7B: 31 -> 33.4 t/s).
+test-backend-ops -o MUL_MAT (n=1): 718/718 passed.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 612d3e3..a635021 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -473,7 +473,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     } else if (table_id == MMVQ_PARAMETERS_GCN) {
+         switch (ncols_dst) {
+             case 1:
+-                return 2;
++                // GCN (e.g. gfx90c, 7 CUs): one wave64 per row is faster for single-token decode,
++                // the second warp only adds an LDS reduction and halves the number of resident blocks.
++                return 1;
+             case 2:
+             case 3:
+                 return type == GGML_TYPE_Q3_K ? 1 : 2;
+-- 
+2.56.1
+

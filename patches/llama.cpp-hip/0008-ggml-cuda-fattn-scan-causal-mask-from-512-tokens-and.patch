@@ -1,0 +1,70 @@
+From 5680690018dd17ee06913f24d281fd9e3c269262 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:45:03 +0100
+Subject: [PATCH 08/11] ggml-cuda: fattn: scan causal mask from 512 tokens and
+ skip KV split on GCN
+
+On GCN (tested: gfx90c, 7 CUs) prefill FA spends a large part of its time
+on fully masked KV tiles and on the parallel_blocks split:
+
+- The KV_max mask scan only runs for Q->ne[1] >= 1024, so a 512-token
+  ubatch computes the masked upper triangle as well. The scan costs
+  ~28 us per layer, the skipped work ~800 us.
+- parallel_blocks starts at the occupancy (2) although the output tiles
+  alone fill many waves (128 tiles vs. 14 blocks per wave), which adds
+  flash_attn_combine_results and extra global traffic.
+
+Lower the scan threshold to 512 and use parallel_blocks = 1 when
+ntiles_dst >= 4 * blocks_per_wave, both only for GCN.
+
+gfx90c, Qwen3-0.6B Q4_K_M, -fa 1, rocprofv3: FA per pp512 run
+96.5 ms (tile 86 + combine 10) -> 58.6 ms. llama-bench pp512 884 -> 940 t/s,
+pp2048 763 -> 810 t/s, tg128 unchanged. test-backend-ops FLASH_ATTN_EXT OK.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn-common.cuh | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index fc0cc74..e2a6598 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1170,7 +1170,10 @@ void launch_fattn(
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
+-    const bool scan_mask = !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
++    // On GCN the scan is cheap relative to the FA kernels, so it already pays off for 512 tokens (causal prefill).
++    const int64_t scan_mask_min_ne11 = GGML_CUDA_CC_IS_GCN(cc) ? 512 : 1024;
++    const bool scan_mask = !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
++        (Q->ne[1] >= scan_mask_min_ne11 || Q->ne[3] > 1 || kv_rows);
+     if (scan_mask) {
+         const int64_t s31 = mask->nb[1] / sizeof(half2);
+         const int64_t s33 = mask->nb[3] / sizeof(half2);
+@@ -1254,12 +1257,20 @@ void launch_fattn(
+         // parallel_blocks must not be larger than what the tensor size allows:
+         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+ 
++        const int blocks_per_wave = nsm * max_blocks_per_sm;
++
++        // On GCN (few CUs) the output tiles alone fill several waves for large batches. Splitting the KV
++        // dimension then only adds the combine kernel and extra global memory traffic, so don't.
++        const bool no_kv_split = GGML_CUDA_CC_IS_GCN(cc) && ntiles_dst >= 4*blocks_per_wave;
++        if (no_kv_split) {
++            parallel_blocks = 1;
++        }
++
+         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+         // Test whether parallel_blocks can be set to a higher value for better efficiency.
+-        const int blocks_per_wave = nsm * max_blocks_per_sm;
+         int nwaves_best = 0;
+         int efficiency_percent_best = 0;
+-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
++        for (int parallel_blocks_test = parallel_blocks; !no_kv_split && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+             const int nblocks_total = ntiles_dst * parallel_blocks_test;
+             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+-- 
+2.56.1
+

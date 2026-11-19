@@ -1,0 +1,247 @@
+From 1409255405355c05b0491ba04cf64efc86359559 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:38:47 +0100
+Subject: [PATCH 04/11] ggml-cuda: hip: float dequant mat-vec for Q4_K on GCN
+ (ncols_dst=1)
+
+GCN chips without dp4a (e.g. gfx90c) spend a lot of ALU on the emulated
+integer dot product and on quantize_q8_1. Add a Q4_K x f32 kernel modelled
+on the Vulkan mul_mat_vec_q4_k shader: 16 threads per super-block, 4 rows
+per 64-thread block (2 with a fused gate), y read as f32, bytes converted
+with v_cvt_f32_ubyteN. Supports bias and gate/GLU fusion.
+GGML_HIP_GCN_FMMV=0 disables it, =1/2/4 selects rows per block;
+GGML_HIP_GCN_FMMV_GATE does the same for the fused-gate case.
+
+gfx90c, Qwen3-0.6B Q4_K_M, tg128: 75.2 -> 82.3 t/s.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 205 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 205 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a635021..d444915 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1459,6 +1459,185 @@ static void mul_mat_vec_q_switch_type(
+     }
+ }
+ 
++
++#if defined(GGML_USE_HIP)
++// GCN without dp4a (gfx900/gfx906 w/o dot use, gfx90c): float dequantization matrix-vector product for Q4_K with
++// ncols_dst == 1. Modelled on the Vulkan shader mul_mat_vec_q4_k.comp: 16 threads per super-block, several rows per
++// 64-thread block sharing the y loads, y in f32 (no quantize_q8_1 pass), bytes converted with v_cvt_f32_ubyteN.
++static __device__ __forceinline__ float ggml_gcn_ubyte(const uint32_t x, const int i) {
++    return (float) ((x >> (8*i)) & 0xFFu);
++}
++
++static __device__ __forceinline__ float ggml_gcn_dot_q4_K_f32(
++        const block_q4_K * __restrict__ b, const int v_im, const int q_offset,
++        const float4 & y10, const float4 & y132, const float4 & y20, const float4 & y232,
++        const float s10, const float s132, const float s20, const float s232) {
++    const float2     dm   = __half22float2(b->dm);
++    const uint16_t * sc16 = (const uint16_t *) b->scales;
++
++    const uint32_t scale0 = sc16[v_im + 0];
++    const uint32_t scale4 = sc16[v_im + 2];
++    const uint32_t scale8 = sc16[v_im + 4];
++    const uint32_t s04l   = (scale4 << 16) | scale0;
++    const uint32_t s04h   = (s04l & 0xC0C0C0C0u) >> 2;
++    const uint32_t s04    = s04l & 0x3F3F3F3Fu;
++    const uint32_t s8     = (((scale8 << 12) | scale8) & 0x0F0F0F0Fu) | s04h;
++
++    const uint32_t q0  = *(const uint32_t *) (b->qs + q_offset);
++    const uint32_t q64 = *(const uint32_t *) (b->qs + q_offset + 64);
++    const uint32_t l0  =  q0        & 0x0F0F0F0Fu;
++    const uint32_t h0  = (q0  >> 4) & 0x0F0F0F0Fu;
++    const uint32_t l64 =  q64       & 0x0F0F0F0Fu;
++    const uint32_t h64 = (q64 >> 4) & 0x0F0F0F0Fu;
++
++    const float sx = y10.x *ggml_gcn_ubyte(l0,  0) + y10.y *ggml_gcn_ubyte(l0,  1) + y10.z *ggml_gcn_ubyte(l0,  2) + y10.w *ggml_gcn_ubyte(l0,  3);
++    const float sy = y132.x*ggml_gcn_ubyte(h0,  0) + y132.y*ggml_gcn_ubyte(h0,  1) + y132.z*ggml_gcn_ubyte(h0,  2) + y132.w*ggml_gcn_ubyte(h0,  3);
++    const float sz = y20.x *ggml_gcn_ubyte(l64, 0) + y20.y *ggml_gcn_ubyte(l64, 1) + y20.z *ggml_gcn_ubyte(l64, 2) + y20.w *ggml_gcn_ubyte(l64, 3);
++    const float sw = y232.x*ggml_gcn_ubyte(h64, 0) + y232.y*ggml_gcn_ubyte(h64, 1) + y232.z*ggml_gcn_ubyte(h64, 2) + y232.w*ggml_gcn_ubyte(h64, 3);
++
++    const float sum_d = sx*ggml_gcn_ubyte(s04, 0) + sy*ggml_gcn_ubyte(s04, 1) + sz*ggml_gcn_ubyte(s8, 0) + sw*ggml_gcn_ubyte(s8, 1);
++    const float sum_m = s10*ggml_gcn_ubyte(s04, 2) + s132*ggml_gcn_ubyte(s04, 3) + s20*ggml_gcn_ubyte(s8, 2) + s232*ggml_gcn_ubyte(s8, 3);
++
++    return dm.x*sum_d - dm.y*sum_m;
++}
++
++template <int nrows_wg, bool has_fusion, bool has_gate>
++__launch_bounds__(64, 1)
++static __global__ void mul_mat_vec_q4_K_f32_gcn(
++        const void * __restrict__ vx, const void * __restrict__ vgate, const float * __restrict__ y,
++        const float * __restrict__ x_bias, const float * __restrict__ gate_bias,
++        const ggml_glu_op glu_op, const float glu_limit,
++        float * __restrict__ dst, const int ncols, const int nrows, const int stride_row) {
++    const int tid  = threadIdx.x;
++    const int itid = tid % 16;
++    const int ix   = tid / 16;
++    const int il   = itid / 4;
++    const int ir   = itid % 4;
++    const int v_im = il / 2;
++    const int v_in = il % 2;
++    const int l0   = 4*(2*ir + v_in);
++    const int q_offset = 32*v_im + l0;
++    const int y_offset = 64*v_im + l0;
++
++    const int row0 = blockIdx.x*nrows_wg;
++    const int nb   = ncols / QK_K;
++
++    constexpr bool use_gate = has_fusion && has_gate;
++
++    float acc [nrows_wg] = {0.0f};
++    float accg[nrows_wg] = {0.0f};
++
++    for (int i = ix; i < nb; i += 4) {
++        const float * yb = y + i*QK_K + y_offset;
++        const float4 y10  = *(const float4 *) (yb +   0);
++        const float4 y132 = *(const float4 *) (yb +  32);
++        const float4 y20  = *(const float4 *) (yb + 128);
++        const float4 y232 = *(const float4 *) (yb + 160);
++        const float s10  = (y10.x  + y10.y)  + (y10.z  + y10.w);
++        const float s132 = (y132.x + y132.y) + (y132.z + y132.w);
++        const float s20  = (y20.x  + y20.y)  + (y20.z  + y20.w);
++        const float s232 = (y232.x + y232.y) + (y232.z + y232.w);
++
++#pragma unroll
++        for (int n = 0; n < nrows_wg; ++n) {
++            const int row = min(row0 + n, nrows - 1);
++            const block_q4_K * bx = (const block_q4_K *) vx + (int64_t) row*stride_row + i;
++            acc[n] += ggml_gcn_dot_q4_K_f32(bx, v_im, q_offset, y10, y132, y20, y232, s10, s132, s20, s232);
++            if constexpr (use_gate) {
++                {
++                    const block_q4_K * bg = (const block_q4_K *) vgate + (int64_t) row*stride_row + i;
++                    accg[n] += ggml_gcn_dot_q4_K_f32(bg, v_im, q_offset, y10, y132, y20, y232, s10, s132, s20, s232);
++                }
++            }
++        }
++    }
++
++#pragma unroll
++    for (int n = 0; n < nrows_wg; ++n) {
++        acc[n] = warp_reduce_sum<64>(acc[n]);
++        if constexpr (use_gate) {
++            {
++                accg[n] = warp_reduce_sum<64>(accg[n]);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int n = 0; n < nrows_wg; ++n) {
++        const int row = row0 + n;
++        if (tid != n || row >= nrows) {
++            continue;
++        }
++        float result = acc[n];
++        if constexpr (has_fusion) {
++            if (x_bias) {
++                result += x_bias[row];
++            }
++            if constexpr (use_gate) {
++                float gate_value = accg[n];
++                if (gate_bias) {
++                    gate_value += gate_bias[row];
++                }
++                switch (glu_op) {
++                    case GGML_GLU_OP_SWIGLU:
++                        result *= ggml_cuda_op_silu_single(gate_value);
++                        break;
++                    case GGML_GLU_OP_GEGLU:
++                        result *= ggml_cuda_op_gelu_single(gate_value);
++                        break;
++                    case GGML_GLU_OP_SWIGLU_OAI:
++                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
++                        break;
++                    case GGML_GLU_OP_SWIGLU_CLAMP:
++                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
++                        break;
++                    default:
++                        result = result * gate_value;
++                        break;
++                }
++            }
++        }
++        dst[row] = result;
++    }
++    GGML_UNUSED(glu_limit);
++}
++
++// 0 = disabled, otherwise rows per 64-thread block (1, 2 or 4).
++// Defaults on GCN: 4 rows, 2 rows with a fused gate (twice the registers); override with GGML_HIP_GCN_FMMV(_GATE).
++static int ggml_cuda_gcn_fmmv_rows(const int cc, const bool gate) {
++    static const int env      = [] { const char * s = getenv("GGML_HIP_GCN_FMMV");      return s ? atoi(s) : -1; }();
++    static const int env_gate = [] { const char * s = getenv("GGML_HIP_GCN_FMMV_GATE"); return s ? atoi(s) : -1; }();
++    if (!GGML_CUDA_CC_IS_GCN(cc) || env == 0) {
++        return 0;
++    }
++    const int e = gate ? env_gate : env;
++    if (e == 1 || e == 2 || e == 4) {
++        return e;
++    }
++    return gate ? 2 : 4;
++}
++
++template <int nrows_wg>
++static void mul_mat_vec_q4_K_f32_gcn_launch(
++        const void * vx, const float * y, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols, const int nrows, const int stride_row, const bool has_fusion, cudaStream_t stream) {
++    const dim3 grid((nrows + nrows_wg - 1) / nrows_wg, 1, 1);
++    const dim3 block(64, 1, 1);
++    if (has_fusion && fusion.gate) {
++        mul_mat_vec_q4_K_f32_gcn<nrows_wg, true, true><<<grid, block, 0, stream>>>(
++            vx, fusion.gate, y, (const float *) fusion.x_bias, (const float *) fusion.gate_bias, fusion.glu_op, fusion.glu_limit,
++            dst, ncols, nrows, stride_row);
++    } else if (has_fusion) {
++        mul_mat_vec_q4_K_f32_gcn<nrows_wg, true, false><<<grid, block, 0, stream>>>(
++            vx, nullptr, y, (const float *) fusion.x_bias, nullptr, fusion.glu_op, fusion.glu_limit,
++            dst, ncols, nrows, stride_row);
++    } else {
++        mul_mat_vec_q4_K_f32_gcn<nrows_wg, false, false><<<grid, block, 0, stream>>>(
++            vx, nullptr, y, nullptr, nullptr, GGML_GLU_OP_SWIGLU, 0.0f, dst, ncols, nrows, stride_row);
++    }
++}
++#endif // defined(GGML_USE_HIP)
++
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+@@ -1555,6 +1734,32 @@ void ggml_cuda_mul_mat_vec_q(
+         }
+     }
+ 
++#if defined(GGML_USE_HIP)
++    {
++        const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        const int fmmv_rows = ggml_cuda_gcn_fmmv_rows(cc, fusion_local.gate != nullptr);
++        if (fmmv_rows > 0 && src0->type == GGML_TYPE_Q4_K && !ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
++                ne02 == 1 && ne03 == 1 && ne00 % QK_K == 0 && ggml_is_contiguous(src1) &&
++                fusion_local.shared_up == nullptr && fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr) {
++            const int  stride_row = src0->nb[1] / ts_src0;
++            const bool has_fusion = fusion != nullptr;
++            switch (fmmv_rows) {
++                case 1:
++                    mul_mat_vec_q4_K_f32_gcn_launch<1>(src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
++                case 2:
++                    mul_mat_vec_q4_K_f32_gcn_launch<2>(src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
++                default:
++                    mul_mat_vec_q4_K_f32_gcn_launch<4>(src0->data, src1_d, fusion_local, dst_d, ne00, ne01, stride_row, has_fusion, stream);
++                    break;
++            }
++            CUDA_CHECK(cudaGetLastError());
++            return;
++        }
++    }
++#endif // defined(GGML_USE_HIP)
++
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+     {
+-- 
+2.56.1
+

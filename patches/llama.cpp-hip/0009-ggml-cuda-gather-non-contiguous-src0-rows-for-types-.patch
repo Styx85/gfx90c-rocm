@@ -1,0 +1,67 @@
+From 24580fad89563e7e2421634e74a1691ebb63ad26 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:29:17 +0100
+Subject: [PATCH 09/11] ggml-cuda: gather non-contiguous src0 rows for types
+ without a strided converter
+
+ggml_cuda_mul_mat_cublas_impl() asserts on a non-contiguous quantized src0
+whose type has no to_fp16_nc/to_bf16_nc converter (all k-quants and
+i-quants). supports_op() accepts such tensors (only nb[0] is checked),
+so e.g. test-backend-ops MUL_MAT with type_a=q4_K and k_v != 0 aborts
+with "GGML_ASSERT(convert_func != nullptr)" on GPUs that take the
+cuBLAS path for these shapes (here: GCN without dp4a, where MMQ is not
+used).
+
+The rows of src0 are contiguous, so copy them into a dense buffer with
+cudaMemcpy2DAsync and use the contiguous converter.
+
+Tested on gfx90c (HIP): test-backend-ops -o MUL_MAT 2688/2688 (before:
+abort at the first q4_K k_v != 0 case).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 40e8375..8474fac 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1954,14 +1954,32 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+             s01 *= src0_bs;
+             s02 *= src0_bs;
+             s03 *= src0_bs;
+-        } else {
++        } else if (traits::convert_nc(src0->type) != nullptr) {
+             const auto convert_func = traits::convert_nc(src0->type);
+-            GGML_ASSERT(convert_func != nullptr);
+             convert_func(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+             s01 = ne00;
+             s02 = ne01*s01;
+             s03 = ne02*s02;
+             is_src0_cont_2 = true;
++        } else {
++            // No strided converter for this type (e.g. k-quants): the rows themselves are contiguous (checked in
++            // supports_op), so gather them into a dense buffer first and use the contiguous converter.
++            const size_t row_size = ggml_row_size(src0->type, ne00);
++            ggml_cuda_pool_alloc<char> src0_dense(ctx.pool(), row_size*ne01*ne02*ne03);
++            for (int64_t i03 = 0; i03 < ne03; ++i03) {
++                for (int64_t i02 = 0; i02 < ne02; ++i02) {
++                    CUDA_CHECK(cudaMemcpy2DAsync(src0_dense.get() + (i03*ne02 + i02)*ne01*row_size, row_size,
++                                                 (const char *) src0->data + i03*nb03 + i02*nb02, nb01,
++                                                 row_size, ne01, cudaMemcpyDeviceToDevice, main_stream));
++                }
++            }
++            const auto convert_func = traits::convert(src0->type);
++            GGML_ASSERT(convert_func != nullptr);
++            convert_func(src0_dense.get(), src0_alloc.get(), ggml_nelements(src0), main_stream);
++            s01 = ne00;
++            s02 = ne01*s01;
++            s03 = ne02*s02;
++            is_src0_cont_2 = true;
+         }
+         src0_ptr = src0_alloc.get();
+     }
+-- 
+2.56.1
+

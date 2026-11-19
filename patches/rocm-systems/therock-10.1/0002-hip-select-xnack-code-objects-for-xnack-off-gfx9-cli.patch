@@ -1,0 +1,82 @@
+From 7eff476312074b86a45b63dad6d3347a185a52c8 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:07:19 +0100
+Subject: [PATCH 2/2] hip: select xnack- code objects for xnack-off gfx9 client
+ APUs
+
+For gfx902/gfx909/gfx90c ROCr reports XNACK as unsupported, so the agent
+ISA name carries no xnack feature (amdgcn-amd-amdhsa--gfx90c). COMGR's
+target-id matching requires an explicit "xnack-" on the query side for a
+code object built with --offload-arch=gfx90c:xnack-, so such fat
+binaries found no code object. The kernel launch then failed with
+hipErrorInvalidImage / hipErrorInvalidKernelFile although the code object
+is exactly right for the device (xnack-off mode).
+
+Also query "<isa>:xnack-" when the device ISA has XNACK unsupported and
+the ISA table has a matching ":xnack-" alias, and use it as the native
+code object if no feature-less one is present.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ projects/clr/hipamd/src/hip_fatbin.cpp | 31 ++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/projects/clr/hipamd/src/hip_fatbin.cpp b/projects/clr/hipamd/src/hip_fatbin.cpp
+index df463671dc..2c14cc9d5f 100644
+--- a/projects/clr/hipamd/src/hip_fatbin.cpp
++++ b/projects/clr/hipamd/src/hip_fatbin.cpp
+@@ -185,6 +185,26 @@ static std::string TargetToGeneric(const std::string &input) {
+   return generic_name;
+ }
+ 
++// Some targets support XNACK in the compiler but are run by ROCr in xnack-off mode with XNACK
++// reported as unsupported (gfx9 client APUs: gfx902/gfx909/gfx90c). The agent ISA name then has
++// no xnack feature (e.g. amdgcn-amd-amdhsa--gfx90c), and COMGR does not match it against code
++// objects built with an explicit "xnack-" (e.g. --offload-arch=gfx90c:xnack-), although those
++// are exactly right for the device. Return that "<isa>:xnack-" alias, or an empty string.
++static std::string XnackOffAlias(const amd::Isa& isa) {
++  if (isa.isXnackSupported()) {
++    return {};
++  }
++  std::string alias = isa.isaName() + ":xnack-";
++  const amd::Isa* alias_isa = amd::Isa::findIsa(alias.c_str());
++  if (alias_isa == nullptr || alias_isa->isXnackSupported() ||
++      alias_isa->versionMajor() != isa.versionMajor() ||
++      alias_isa->versionMinor() != isa.versionMinor() ||
++      alias_isa->versionStepping() != isa.versionStepping()) {
++    return {};
++  }
++  return alias;
++}
++
+ static bool IsCodeObjectUncompressed(const void* image, size_t image_size) {
+   constexpr size_t magic_size = sizeof(symbols::kOffloadBundleUncompressedMagicStr) - 1;
+   if (image_size < magic_size) {
+@@ -509,6 +529,10 @@ hipError_t FatBinaryInfo::ExtractFatBinaryUsingCOMGR(const std::vector<hip::Devi
+   for (auto device : devices) {
+     std::string device_name = device->devices()[0]->isa().isaName();
+     unique_isa_names.insert(device_name);
++    auto xnack_off_name = XnackOffAlias(device->devices()[0]->isa());
++    if (!xnack_off_name.empty()) {
++      unique_isa_names.insert(xnack_off_name);
++    }
+     auto generic_name = TargetToGeneric(device_name);
+     if (!generic_name.empty()) {
+       unique_isa_names.insert(generic_name);
+@@ -539,6 +563,13 @@ hipError_t FatBinaryInfo::ExtractFatBinaryUsingCOMGR(const std::vector<hip::Devi
+       std::string device_name = device->devices()[0]->isa().isaName();
+       auto generic_target_name = TargetToGeneric(device_name);   // Generic Code Object
+       auto native_co = code_obj_map.find(device_name);           // Native Code Object
++      if (native_co == code_obj_map.end()) {
++        // Native code object built with explicit xnack- for an xnack-off device
++        auto xnack_off_name = XnackOffAlias(device->devices()[0]->isa());
++        if (!xnack_off_name.empty()) {
++          native_co = code_obj_map.find(xnack_off_name);
++        }
++      }
+       auto generic_co = code_obj_map.find(generic_target_name);  // generic Code Object
+ 
+       // If the size is not 0, that means we found the native isa code object
+-- 
+2.56.1
+

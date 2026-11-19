@@ -1,0 +1,42 @@
+From 859bcb502f5ecdcd4fdd52a44d88ff8918408e18 Mon Sep 17 00:00:00 2001
+From: Christoph Berliner <32103696+Styx85@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:02:23 +0100
+Subject: [PATCH 02/11] HIP: use v_mad_mix_f32 for half2 dot products on GCN5
+ without dot insts
+
+gfx900/gfx909/gfx90c have no v_dot2_f32_f16, so ggml_cuda_mad(float&, half2, half2)
+fell back to a half2 multiply plus conversions. In the FlashAttention tile
+kernel this lets the scheduler hoist all LDS loads of the unrolled loops:
+for gfx90c the DKQ=DV=128 kernels spilled up to 750 VGPRs (2.5 KiB scratch
+per lane), while gfx906 compiles the same code without spills.
+
+With two v_mad_mix_f32 (f16 inputs, f32 product/accumulator) in a volatile
+asm block the resource usage matches gfx906 (e.g. ncols 32x2: 744 -> 21
+spilled VGPRs, decode ncols 1x2: 115 -> 73 VGPRs, occupancy 2 -> 3), and the
+products are computed in f32 instead of f16.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index fd047d7..17e1bd3 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -815,6 +815,12 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float2 v
+ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v, const half2 u) {
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+     asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(acc) : "v"(v), "v"(u));
++#elif defined(GGML_USE_HIP) && (defined(__gfx900__) || defined(__gfx909__) || defined(__gfx90c__))
++    // GCN5 without dot instructions: two mixed-precision FMAs (f16 inputs, f32 product and accumulator).
++    // More precise than the half2 multiply below, and as a volatile asm block it keeps the scheduler from
++    // hoisting all shared memory loads of the unrolled FA loops, which otherwise spill hundreds of VGPRs.
++    asm volatile("v_mad_mix_f32 %0, %1, %2, %0 op_sel_hi:[1,1,0]\n\t"
++                 "v_mad_mix_f32 %0, %1, %2, %0 op_sel:[1,1,0] op_sel_hi:[1,1,0]" : "+v"(acc) : "v"(v), "v"(u));
+ #else
+ #ifdef FAST_FP16_AVAILABLE
+     const float2 tmp = __half22float2(v*u);
+-- 
+2.56.1
+
