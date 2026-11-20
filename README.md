@@ -4,7 +4,7 @@ Patches and measurements that make ROCm (HIP, rocBLAS, PyTorch, llama.cpp-HIP) r
 Cezanne/Renoir APUs (**gfx90c**, GCN 5, Wave64), without `HSA_OVERRIDE_GFX_VERSION`.
 
 Tested on: Ryzen 5 5600G (Vega 7, 7 CUs), DDR4-3200, Proxmox VE kernel 7.0.14, Arch Linux container, ROCm 10.1
-(TheRock), Mesa 26.2.
+(TheRock), Mesa 26.2 / 26.3.1.
 
 > **How this was made:** AI-assisted (Claude Code agents running a measure-change-measure loop on real hardware over
 > three days, November 2026). Every result below was measured, but on one machine only. Shared as-is for people
@@ -22,6 +22,8 @@ Tested on: Ryzen 5 5600G (Vega 7, 7 CUs), DDR4-3200, Proxmox VE kernel 7.0.14, A
 | K | Linux amdgpu (GC 9.3.0) | after a GPU reset (MODE2) KFD is dead until reboot: the HIQ (and stuck HWS queues) stay active across MODE2 | deactivate all compute HQDs except the KIQ before MODE2 (`patches/linux`, 2 patches) |
 | C | llama.cpp HIP backend | GCN5 has no dot instructions; FA spills, slow mmvq decode | 11 patches (`patches/llama.cpp-hip`) |
 | L | Loom/HRX SPIR-V (Vulkan) | clustered f32 subgroup sums (XOR butterfly) slower than native `ClusteredReduce` on GFX9/Wave64 for cluster sizes ≥ 8: XOR 4/16 lower to `ds_swizzle` (LDS) instead of DPP | **fixed upstream** by ROCm/hrx-system#3467 (reported in #3455) |
+| M1 | Mesa NIR (RADV) | `(x >>s 15) & 0x7fff` on 16-bit integers returns `0xffff`: the unsigned-upper-bound analysis treated 16-bit `ishr` sources as non-negative and dropped the mask (wrong f16/bf16 min/max in Loom) | **fixed upstream** in Mesa e7dedf078, included in **Mesa 26.3.1** |
+| M2 | Mesa ACO (RADV) | VGPRs spilled to LDS (`ds_write/read_addtid_b32`) carry no memory sync info, so the scheduler can move a spill store above the reload of the same slot → silently wrong values under register pressure | reported in mesa/mesa#16952 with a suggested patch |
 
 Vulkan (RADV) patches for llama.cpp are in a separate repo: https://github.com/Styx85/gfx90c-vulkan-patches
 
@@ -55,6 +57,12 @@ Memory bandwidth under HIP and Vulkan is the same (~45 GB/s STREAM); KFD puts "V
 - Without patch K, every GPU reset (e.g. a hung kernel) leaves KFD unusable until reboot, while graphics/Vulkan keep
   working. With it, resets recover (tested: requested resets and provoked preemption failures).
 - `HSA_OVERRIDE_GFX_VERSION=9.0.0` with `gfx900:xnack-` code produced **silently wrong results** – don't rely on it.
+- **Use Mesa ≥ 26.3.1 for Vulkan compute** on this GPU (M1 above). Older RADV miscompiles a common 16-bit
+  integer pattern.
+- **PyTorch: enable TunableOp** (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0` – there is no
+  hipBLASLt for gfx90c). The rocBLAS default solution is often not the fastest here: Whisper large-v3-turbo encoder
+  3.61 → 3.04 s, a whole transcription −20 %, demucs −13 %, same results. Tune once, then run with
+  `PYTORCH_TUNABLEOP_TUNING=0`; in a systemd unit write `%%d` in the file name.
 - When comparing two llama.cpp builds, copied binaries keep the RUNPATH of their build folder and load the wrong
   library – run each from its own build directory.
 
@@ -77,12 +85,15 @@ The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.
 | Item | Status |
 |---|---|
 | R1 | supported the existing PR ROCm/rocm-systems#13903 with test data; ROCm 10.2 does not contain the fix yet |
-| R1 + R1b | PR ROCm/rocm-systems#16218 |
+| R1 + R1b | PR ROCm/rocm-systems#16218 (with hip-tests regression tests since 20 Nov) |
 | R4 | PR ROCm/rocm-libraries#16348 |
 | R2 | PR ROCm/rocm-libraries#16349 |
-| R3 | PR ROCm/rocm-libraries#16350 |
+| R3 | PR ROCm/rocm-libraries#16350; natively tuned gfx90c kernels from @Netherquark's [oto](https://github.com/Netherquark/oto) are planned to be added there (e.g. HGEMM MT128x128x16: ~2650 instead of ~1830 GFLOPS at 4096³ on a 5600G) |
 | L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
-| K (kernel) | not submitted (needs a human submitter with Signed-off-by per kernel rules) |
+| K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177 with the patches as a suggested fix (no Signed-off-by), plus a test report on amd-gfx for c3988a7ad479 |
+| Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass, the remaining failures traced to Mesa (M1, M2) or missing cooperative matrix – ROCm/hrx-system#3492 |
+| M1 / M2 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952 |
+| Status trackers | gfx90c data points in ROCm/TheRock#7609 and #9221 (NO_HWS hard lock) |
 | C, Vulkan | not submitted (llama.cpp does not accept AI-written PRs/issues) |
 
 If you maintain one of these projects and want to pick something up: please do, credit is not needed.
