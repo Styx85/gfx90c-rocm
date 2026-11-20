@@ -93,7 +93,7 @@ The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.
 | R2 | PR ROCm/rocm-libraries#16349 |
 | R3 | PR ROCm/rocm-libraries#16350; natively tuned gfx90c kernels from @Netherquark's [oto](https://github.com/Netherquark/oto) are planned to be added there (e.g. HGEMM MT128x128x16: ~2650 instead of ~1830 GFLOPS at 4096³ on a 5600G) |
 | L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
-| K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177 with the patches as a suggested fix (no Signed-off-by), plus a test report on amd-gfx for c3988a7ad479 |
+| K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request **submitted to amd-gfx on 20 Nov 2026** as "[PATCH 0/2] drm/amdgpu/gfx9: make KFD usable again after MODE2 on Renoir" (signed off by me, Assisted-by tag) |
 | K – possibly related | drm/amd#6053 (same reset-domain trylock problem on gfx1103/MES, found by AMD) and ROCm/TheRock#8357 (Lucienne gfx90c: ROCm broken after the first reset) – both linked to #6177 |
 | Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass, the remaining failures traced to Mesa (M1, M2) or missing cooperative matrix – ROCm/hrx-system#3492 |
 | M1 / M2 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952 with a suggested patch that works locally |
