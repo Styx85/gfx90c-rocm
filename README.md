@@ -21,6 +21,7 @@ Tested on: Ryzen 5 5600G (Vega 7, 7 CUs), DDR4-3200, Proxmox VE kernel 7.0.14, A
 | R4 | Tensile | `ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH` / solution index → `internal_error` (code object of preloaded libraries never loaded) – architecture-independent | `patches/rocm-libraries/develop/0002` |
 | K | Linux amdgpu (GC 9.3.0) | after a GPU reset (MODE2) KFD is dead until reboot: the HIQ (and stuck HWS queues) stay active across MODE2 | deactivate all compute HQDs except the KIQ before MODE2 (`patches/linux`, 2 patches) |
 | C | llama.cpp HIP backend | GCN5 has no dot instructions; FA spills, slow mmvq decode | 11 patches (`patches/llama.cpp-hip`) |
+| L | Loom/HRX SPIR-V (Vulkan) | clustered f32 subgroup sums (XOR butterfly) slower than native `ClusteredReduce` on GFX9/Wave64 for cluster sizes ≥ 8: XOR 4/16 lower to `ds_swizzle` (LDS) instead of DPP | **fixed upstream** by ROCm/hrx-system#3467 (reported in #3455) |
 
 Vulkan (RADV) patches for llama.cpp are in a separate repo: https://github.com/Styx85/gfx90c-vulkan-patches
 
@@ -71,7 +72,7 @@ hipcc --offload-arch=gfx90c prog.hip   # no HSA_OVERRIDE_GFX_VERSION
 The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.0.14 kernel; we build only
 `amdgpu.ko` out of tree with the exact distribution sources and compiler.
 
-## Upstream status (19 Nov 2026)
+## Upstream status (20 Nov 2026)
 
 | Item | Status |
 |---|---|
@@ -80,11 +81,27 @@ The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.
 | R4 | PR ROCm/rocm-libraries#16348 |
 | R2 | PR ROCm/rocm-libraries#16349 |
 | R3 | PR ROCm/rocm-libraries#16350 |
+| L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
 | K (kernel) | not submitted (needs a human submitter with Signed-off-by per kernel rules) |
 | C, Vulkan | not submitted (llama.cpp does not accept AI-written PRs/issues) |
 
 If you maintain one of these projects and want to pick something up: please do, credit is not needed.
 Issues with numbers from other gfx90c/gfx902/gfx909 machines are welcome.
+
+## Loom fix #3467, re-measured on gfx90c
+
+Clustered f32 sums, subgroup 64, 32 chained sums, Vulkan (RADV/ACO), time per dispatch:
+
+| Cluster size | butterfly before | butterfly with #3467 | native `ClusteredReduce` |
+|---|---|---|---|
+| 4 | 294 µs | 297 µs | 355 µs |
+| 8 | 481 µs | 306 µs | 408 µs |
+| 16 | 482 µs | 351 µs | 465 µs |
+| 32 | 955 µs | 482 µs | 491 µs |
+
+`ds_swizzle` instructions: 32 → 0 (C=8/16), 64 → 32 (C=32). With the fix the butterfly is faster than native at every
+cluster size. Loom's documentation example tests that target Vulkan (saxpy, `guide/checks-and-benchmarks`,
+`guide/functions-and-control`) pass on gfx90c.
 
 ## License
 
