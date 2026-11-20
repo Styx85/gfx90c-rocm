@@ -27,6 +27,9 @@ Tested on: Ryzen 5 5600G (Vega 7, 7 CUs), DDR4-3200, Proxmox VE kernel 7.0.14, A
 
 Vulkan (RADV) patches for llama.cpp are in a separate repo: https://github.com/Styx85/gfx90c-vulkan-patches
 
+Immich machine learning (CLIP smart search + face recognition) on gfx90c with PyTorch/ROCm, plus face-model notes:
+https://github.com/Styx85/immich-face-recognition-notes
+
 ## Results (gfx90c)
 
 **rocBLAS GEMM, GFLOPS** (gfx90c kernels vs. gfx9-generic fallback):
