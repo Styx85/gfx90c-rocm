@@ -23,7 +23,7 @@ Tested on: Ryzen 5 5600G (Vega 7, 7 CUs), DDR4-3200, Proxmox VE kernel 7.0.14, A
 | C | llama.cpp HIP backend | GCN5 has no dot instructions; FA spills, slow mmvq decode | 11 patches (`patches/llama.cpp-hip`) |
 | L | Loom/HRX SPIR-V (Vulkan) | clustered f32 subgroup sums (XOR butterfly) slower than native `ClusteredReduce` on GFX9/Wave64 for cluster sizes ≥ 8: XOR 4/16 lower to `ds_swizzle` (LDS) instead of DPP | **fixed upstream** by ROCm/hrx-system#3467 (reported in #3455) |
 | M1 | Mesa NIR (RADV) | `(x >>s 15) & 0x7fff` on 16-bit integers returns `0xffff`: the unsigned-upper-bound analysis treated 16-bit `ishr` sources as non-negative and dropped the mask (wrong f16/bf16 min/max in Loom) | **fixed upstream** in Mesa e7dedf078, included in **Mesa 26.3.1** |
-| M2 | Mesa ACO (RADV) | VGPRs spilled to LDS (`ds_write/read_addtid_b32`) carry no memory sync info, so the scheduler can move a spill store above the reload of the same slot → silently wrong values under register pressure | reported in mesa/mesa#16952 with a suggested patch |
+| M2 | Mesa ACO (RADV) | VGPRs spilled to LDS (`ds_write/read_addtid_b32`) carry no memory sync info, so the scheduler can move a spill store above the reload of the same slot → silently wrong values under register pressure | reported in mesa/mesa#16952 with a suggested patch, tested successfully locally (reproducer and the affected Loom test pass with it) |
 
 Vulkan (RADV) patches for llama.cpp are in a separate repo: https://github.com/Styx85/gfx90c-vulkan-patches
 
@@ -92,7 +92,7 @@ The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.
 | L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
 | K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177 with the patches as a suggested fix (no Signed-off-by), plus a test report on amd-gfx for c3988a7ad479 |
 | Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass, the remaining failures traced to Mesa (M1, M2) or missing cooperative matrix – ROCm/hrx-system#3492 |
-| M1 / M2 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952 |
+| M1 / M2 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952 with a suggested patch that works locally |
 | Status trackers | gfx90c data points in ROCm/TheRock#7609 and #9221 (NO_HWS hard lock) |
 | C, Vulkan | not submitted (llama.cpp does not accept AI-written PRs/issues) |
 
