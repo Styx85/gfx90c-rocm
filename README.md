@@ -96,7 +96,7 @@ The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.
 | K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request submitted to amd-gfx on 20 Nov 2026 as a 2-patch series; following review, squashed into one patch for all gfx9 APUs and **sent as v2 on 21 Nov 2026**: "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (signed off by me, Assisted-by tag) |
 | K – possibly related | drm/amd#6053 (same reset-domain trylock problem on gfx1103/MES, found by AMD) and ROCm/TheRock#8357 (Lucienne gfx90c: ROCm broken after the first reset) – both linked to #6177 |
 | Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass, the remaining failures traced to Mesa (M1, M2) or missing cooperative matrix – ROCm/hrx-system#3492 |
-| M1 / M2 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952, fix proposed upstream in mesa/mesa!46557 (tested on gfx90c) |
+| M1 / M2 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952, fix proposed upstream in mesa/mesa!46557 (tested on gfx90c, Tested-by given) |
 | Status trackers | gfx90c data points in ROCm/TheRock#7609 and #9221 (NO_HWS hard lock) |
 | C, Vulkan | not submitted (llama.cpp does not accept AI-written PRs/issues) |
 
