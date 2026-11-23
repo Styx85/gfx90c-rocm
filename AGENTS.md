@@ -15,7 +15,7 @@ timeout, amdgpu.noretry, sched_policy NO_HWS hard lock, PyTorch ROCm, TunableOp,
 |---|---|---|
 | `patches/rocm-systems/{develop,therock-10.1}/` | CLR ISA table vs. ROCr (xnack), HIP fat-binary selection of `gfx90c:xnack-` | ROCm/rocm-systems#16218 (and #13903) |
 | `patches/rocm-libraries/{develop,therock-10.1}/` | Tensile generic fallback, override code object fix, gfx90c logic + re-tuned selection tables (`make_gfx90c_logic.sh`) | ROCm/rocm-libraries#16348, #16349, #16350 |
-| `patches/linux/v2/` | deactivate all compute HQDs except the KIQ before MODE2 on gfx9 APUs – the version sent to amd-gfx | drm/amd#6177, "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (21 Nov 2026) |
+| `patches/linux/v2/` | deactivate all compute HQDs except the KIQ before MODE2 on gfx9 APUs – the version sent to amd-gfx | drm/amd#6177, "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (21 Nov 2026), applied by Alex Deucher 23 Nov 2026 |
 | `patches/linux/{amd-staging-drm-next,proxmox-7.0.14}/` | v1: the same fix as a 2-patch series, Renoir only | superseded by v2 |
 | `tests/` | test programs and scripts (HIP/rocBLAS checks, GPU reset test, Loom Vulkan suite runner, Mesa MR rounds, #16891 reproducer) | – |
 | `patches/llama.cpp-hip/` | 11 GCN5 patches for the HIP backend | not submitted (see rules) |
