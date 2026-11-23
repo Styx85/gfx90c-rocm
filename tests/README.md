@@ -39,9 +39,20 @@ hrx-system `16a60473`, 304 Vulkan tests, RADV on gfx90c, Mesa 26.3.1 built from 
 | 26.3.1 + both | 292 | 5 | 7 |
 | main (26.99.99, 22 Nov, without !46557) | 291 | 6 | 7 |
 
-!46557 fixes `numeric_vector_f32_test` (in a single-test A/B on the same tree: 16 failing trials → 0). Still failing:
-`inverse_hyperbolic_stress`, `vulkan_tests`, `numeric_matrix_epilogue`, `numeric_matrix_publication`,
-`control_branch_guards`. Not built (7): BDA/extended-types compile-only targets and the C binding examples.
+!46557 fixes `numeric_vector_f32_test` (in a single-test A/B on the same tree: 16 failing trials → 0). The 7 "not
+built" tests were a gap in our partial build, not a Loom problem: with a full build (23 Nov) all 7 pass.
+
+### Loom versions (23 Nov 2026, Mesa 26.3.1 + !46557, full build)
+
+| Loom | tests | ok | failed |
+|---|---|---|---|
+| `16a60473` (tested 22 Nov) | 304 | 299 | 5 |
+| v0.3.0 (`e2c41a72`) | 308 | 303 | 5 |
+| main (`6de1eb17`, 23 Nov) | 308 | 303 | 5 |
+
+The same 5 tests fail on all three: `inverse_hyperbolic_stress`, `vulkan_tests`, `numeric_matrix_epilogue`,
+`numeric_matrix_publication`, `control_branch_guards`. The 4 tests new in v0.3.0 pass. Building main now needs Node.js
+with corepack for the serving dashboard (`build_tools/serve_web`); without it, `ninja -k 0` builds everything else.
 
 ## Mesa MRs on RADV/gfx90c (22 Nov 2026)
 

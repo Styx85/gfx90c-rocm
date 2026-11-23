@@ -102,7 +102,7 @@ only `amdgpu.ko` out of tree with the exact distribution sources and compiler. C
 | L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
 | K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request submitted to amd-gfx on 20 Nov 2026 as a 2-patch series; following review, squashed into one patch for all gfx9 APUs and **sent as v2 on 21 Nov 2026**: "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (signed off by me, Assisted-by tag; patch in `patches/linux/v2/`) |
 | K – possibly related | drm/amd#6053 (same reset-domain trylock problem on gfx1103/MES, found by AMD) and ROCm/TheRock#8357 (Lucienne gfx90c: ROCm broken after the first reset) – both linked to #6177 |
-| Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass at first report (ROCm/hrx-system#3492); with Mesa 26.3.1 + !46557 now **292/304** (5 failing, 7 not built; `tests/README.md`) |
+| Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass at first report (ROCm/hrx-system#3492); with Mesa 26.3.1 + !46557 and a full build **299/304**; Loom v0.3.0 and main (23 Nov) **303/308** – the same 5 tests still fail (`tests/README.md`) |
 | M1 / M2 / M3 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952, fix proposed upstream in mesa/mesa!46557 (tested on gfx90c, Tested-by given, not merged yet); M3: fix mesa/mesa!46405 confirmed on gfx90c |
 | Status trackers | gfx90c data points in ROCm/TheRock#7609 and #9221 (NO_HWS hard lock) |
 | C, Vulkan | not submitted (llama.cpp does not accept AI-written PRs/issues) |
