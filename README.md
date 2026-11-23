@@ -19,11 +19,12 @@ Tested on: Ryzen 5 5600G (Vega 7, 7 CUs), DDR4-3200, Proxmox VE kernel 7.0.14, A
 | R2 | rocBLAS/Tensile | no Tensile library for gfx90c and no fallback to `gfx9-generic` | exact arch → LLVM generic family fallback (`patches/rocm-libraries/*/0001`) |
 | R3 | rocBLAS | only the slow generic fallback kernels | gfx90c logic generated from vega10 (`make_gfx90c_logic.sh`), selection tables re-tuned on gfx90c (`0004`–`0006`) |
 | R4 | Tensile | `ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH` / solution index → `internal_error` (code object of preloaded libraries never loaded) – architecture-independent | `patches/rocm-libraries/develop/0002` |
-| K | Linux amdgpu (GC 9.3.0) | after a GPU reset (MODE2) KFD is dead until reboot: the HIQ (and stuck HWS queues) stay active across MODE2 | deactivate all compute HQDs except the KIQ before MODE2 (`patches/linux`; upstream v2 is a single patch for all gfx9 APUs) |
+| K | Linux amdgpu (GC 9.3.0) | after a GPU reset (MODE2) KFD is dead until reboot: the HIQ (and stuck HWS queues) stay active across MODE2 | deactivate all compute HQDs except the KIQ before MODE2 – `patches/linux/v2/` (one patch for all gfx9 APUs, as sent upstream; the older 2-patch series v1 is kept next to it) |
 | C | llama.cpp HIP backend | GCN5 has no dot instructions; FA spills, slow mmvq decode | 11 patches (`patches/llama.cpp-hip`) |
 | L | Loom/HRX SPIR-V (Vulkan) | clustered f32 subgroup sums (XOR butterfly) slower than native `ClusteredReduce` on GFX9/Wave64 for cluster sizes ≥ 8: XOR 4/16 lower to `ds_swizzle` (LDS) instead of DPP | **fixed upstream** by ROCm/hrx-system#3467 (reported in #3455) |
 | M1 | Mesa NIR (RADV) | `(x >>s 15) & 0x7fff` on 16-bit integers returns `0xffff`: the unsigned-upper-bound analysis treated 16-bit `ishr` sources as non-negative and dropped the mask (wrong f16/bf16 min/max in Loom) | **fixed upstream** in Mesa e7dedf078, included in **Mesa 26.3.1** |
-| M2 | Mesa ACO (RADV) | VGPRs spilled to LDS (`ds_write/read_addtid_b32`) carry no memory sync info, so the scheduler can move a spill store above the reload of the same slot → silently wrong values under register pressure | reported in mesa/mesa#16952; **fix proposed upstream** by the ACO developers in mesa/mesa!46557 (marked for stable), tested on gfx90c: the affected Loom test passes with it |
+| M2 | Mesa ACO (RADV) | VGPRs spilled to LDS (`ds_write/read_addtid_b32`) carry no memory sync info, so the scheduler can move a spill store above the reload of the same slot → silently wrong values under register pressure | reported in mesa/mesa#16952; **fix proposed upstream** by the ACO developers in mesa/mesa!46557 (marked for stable), tested on gfx90c: the affected Loom test passes with it (16 failing trials → 0) |
+| M3 | Mesa NIR (RADV) | `try_fold_shared2` asserts (`st64 \|\| normal`) on a constant shared address that wraps around (only in builds with assertions) | mesa/mesa#16891, fix mesa/mesa!46405 confirmed on gfx90c with a minimal reproducer (`tests/mesa-16891`) |
 
 Vulkan (RADV) patches for llama.cpp are in a separate repo: https://github.com/Styx85/gfx90c-vulkan-patches
 
@@ -31,6 +32,8 @@ Immich machine learning (CLIP smart search + face recognition) on gfx90c with Py
 https://github.com/Styx85/immich-face-recognition-notes
 
 ## Results (gfx90c)
+
+Test programs and scripts for the GEMM check, the GPU reset test and the Vulkan/Mesa results: [`tests/`](tests/README.md).
 
 **rocBLAS GEMM, GFLOPS** (gfx90c kernels vs. gfx9-generic fallback):
 
@@ -49,6 +52,9 @@ Vulkan is still faster for token generation (~100 t/s), so for LLM serving use V
 real time, same WER) and the CPU stays free; fp16 matmul up to +82 % with the tuned tables.
 
 Memory bandwidth under HIP and Vulkan is the same (~45 GB/s STREAM); KFD puts "VRAM" allocations into GTT on this APU.
+
+**Mesa MRs on RADV (22 Nov):** mesa/mesa!45511 gives llama.cpp Vulkan pp512 +1.9 % (Qwen3-1.7B); six other MRs
+showed no effect on the Loom suite, and llama.cpp stayed within noise where measured. Details: [`tests/README.md`](tests/README.md).
 
 ## Important lessons
 
@@ -80,10 +86,11 @@ export LD_LIBRARY_PATH=/opt/rocm-gfx90c/rocblas/lib:/opt/rocm-gfx90c/lib   # own
 hipcc --offload-arch=gfx90c prog.hip   # no HSA_OVERRIDE_GFX_VERSION
 ```
 
-The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.0.14 kernel; we build only
-`amdgpu.ko` out of tree with the exact distribution sources and compiler.
+The kernel patch (`patches/linux/v2/`) applies to `amd-staging-drm-next` and to the Proxmox 7.0.14 kernel; we build
+only `amdgpu.ko` out of tree with the exact distribution sources and compiler. Check it with
+`tests/kernel-reset/reset-test.sh`.
 
-## Upstream status (20 Nov 2026)
+## Upstream status (23 Nov 2026)
 
 | Item | Status |
 |---|---|
@@ -93,10 +100,10 @@ The kernel patches are against `amd-staging-drm-next` and against the Proxmox 7.
 | R2 | PR ROCm/rocm-libraries#16349 |
 | R3 | PR ROCm/rocm-libraries#16350; natively tuned gfx90c kernels from @Netherquark's [oto](https://github.com/Netherquark/oto) are planned to be added there (e.g. HGEMM MT128x128x16: ~2650 instead of ~1830 GFLOPS at 4096³ on a 5600G) |
 | L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
-| K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request submitted to amd-gfx on 20 Nov 2026 as a 2-patch series; following review, squashed into one patch for all gfx9 APUs and **sent as v2 on 21 Nov 2026**: "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (signed off by me, Assisted-by tag) |
+| K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request submitted to amd-gfx on 20 Nov 2026 as a 2-patch series; following review, squashed into one patch for all gfx9 APUs and **sent as v2 on 21 Nov 2026**: "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (signed off by me, Assisted-by tag; patch in `patches/linux/v2/`) |
 | K – possibly related | drm/amd#6053 (same reset-domain trylock problem on gfx1103/MES, found by AMD) and ROCm/TheRock#8357 (Lucienne gfx90c: ROCm broken after the first reset) – both linked to #6177 |
-| Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass, the remaining failures traced to Mesa (M1, M2) or missing cooperative matrix – ROCm/hrx-system#3492 |
-| M1 / M2 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952, fix proposed upstream in mesa/mesa!46557 (tested on gfx90c, Tested-by given) |
+| Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass at first report (ROCm/hrx-system#3492); with Mesa 26.3.1 + !46557 now **292/304** (5 failing, 7 not built; `tests/README.md`) |
+| M1 / M2 / M3 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952, fix proposed upstream in mesa/mesa!46557 (tested on gfx90c, Tested-by given, not merged yet); M3: fix mesa/mesa!46405 confirmed on gfx90c |
 | Status trackers | gfx90c data points in ROCm/TheRock#7609 and #9221 (NO_HWS hard lock) |
 | C, Vulkan | not submitted (llama.cpp does not accept AI-written PRs/issues) |
 
