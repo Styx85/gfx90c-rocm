@@ -122,7 +122,7 @@ Lesson: adding a solution to a Tensile table shifts rocBLAS solution indices, so
 wrong solutions afterwards (Whisper got 4 % *slower* until TunableOp was re-run). Regenerate TunableOp files after any
 library change.
 
-## Upstream status (26 Nov 2026)
+## Upstream status (26 Nov 2026, evening)
 
 | Item | Status |
 |---|---|
@@ -132,7 +132,7 @@ library change.
 | R2 | PR ROCm/rocm-libraries#16349 |
 | R3 | PR ROCm/rocm-libraries#16350; natively tuned gfx90c kernels from @Netherquark's [oto](https://github.com/Netherquark/oto) are planned to be added there; oto configurations re-measured on a 5600G: big gains where the current selection has gaps, small gains on the PyTorch fp16 path ([below](#oto-kernels-re-measured-on-gfx90c-26-nov-2026)) |
 | L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
-| K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request submitted to amd-gfx on 20 Nov 2026 as a 2-patch series; following review, squashed into one patch for all gfx9 APUs and **sent as v2 on 21 Nov 2026**: "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (signed off by me, Assisted-by tag; patch in `patches/linux/v2/`); **reviewed and applied** by Alex Deucher on 23 Nov 2026 (https://lore.kernel.org/amd-gfx/CADnq5_MjcV0Zg1a=ud0rTmdfmPueu9aokn_fewgU47104UJwJg@mail.gmail.com/), in amd-staging-drm-next as aecf8b416, drm/amd#6177 closed on 25 Nov |
+| K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request submitted to amd-gfx on 20 Nov 2026 as a 2-patch series; following review, squashed into one patch for all gfx9 APUs and **sent as v2 on 21 Nov 2026**: "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (signed off by me, Assisted-by tag; patch in `patches/linux/v2/`); **reviewed and applied** by Alex Deucher on 23 Nov 2026 (https://lore.kernel.org/amd-gfx/CADnq5_MjcV0Zg1a=ud0rTmdfmPueu9aokn_fewgU47104UJwJg@mail.gmail.com/), in amd-staging-drm-next as aecf8b416, drm/amd#6177 closed on 25 Nov; **sent upstream on 26 Nov** in the amdgpu pull requests `amd-drm-fixes-7.4-2026-11-26` (for Linux 7.4) and `amd-drm-next-7.5-2026-11-26` |
 | K – possibly related | drm/amd#6053 (same reset-domain trylock problem on gfx1103/MES, found by AMD) and ROCm/TheRock#8357 (Lucienne gfx90c: ROCm broken after the first reset) – both linked to #6177 |
 | Vulkan test suite | Loom/IREE Vulkan tests on gfx90c: 289/304 pass at first report (ROCm/hrx-system#3492); with Mesa 26.3.1 + !46557 and a full build **299/304**; Loom v0.3.0 and main (23 Nov) **303/308** – the same 5 tests still fail (`tests/README.md`) |
 | M1 / M2 / M3 (Mesa) | M1 fixed in 26.3.1; M2 reported in mesa/mesa#16952, **fixed** by mesa/mesa!46557 (merged 25 Nov, #16952 closed; tested on gfx90c, Tested-by given); M3: fix mesa/mesa!46405 confirmed on gfx90c (Tested-by given) and **merged** (23 Nov) |
