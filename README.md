@@ -42,6 +42,10 @@ Test programs and scripts for the GEMM check, the GPU reset test and the Vulkan/
 | SGEMM | 673 / 672 | 929 / 762 | 977 / 769 | 1396 / 748 |
 | HGEMM | 796 / 706 | 1494 / 816 | 1807 / 672 | 1834 / 1254 |
 
+Measured with `tests/hip/gemm.cpp`, which times only 5 iterations at n = 4096 right after a CPU-side result check, so the
+iGPU may still be clocking up: values at large n can be too low (re-measured 26 Nov: HGEMM 4096³ ~2800 GFLOPS in steady
+runs, with the vega10 and the re-tuned tables alike).
+
 Re-tuned selection tables (R3): 3390 problem sizes, median 1.67× faster than the vega10 table choice (it picked tiny
 tiles because of nearest-neighbour matching on raw sizes).
 
@@ -90,7 +94,35 @@ The kernel patch (`patches/linux/v2/`) applies to `amd-staging-drm-next` and to 
 only `amdgpu.ko` out of tree with the exact distribution sources and compiler. Check it with
 `tests/kernel-reset/reset-test.sh`.
 
-## Upstream status (25 Nov 2026)
+## oto kernels re-measured on gfx90c (26 Nov 2026)
+
+Configurations from [oto](https://github.com/Netherquark/oto) benchmarked with Tensile (develop, Assembly kernels,
+validation passed) against `rocblas-bench` with the gfx90c tables from R3. One machine (5600G, DDR4-3200). Configs and
+how to run them: [`tests/tensile-oto/`](tests/tensile-oto/README.md).
+
+**Square NN, GFLOPS (rocBLAS / best oto config):**
+
+| n | 1024 | 1365 | 2048 | 4096 |
+|---|---|---|---|---|
+| SGEMM | 893 / 1192 (+34 %) | 1267 / 1285 (+1 %) | 975 / 1354 (+39 %) | 1441 / 1403 (−3 %) |
+| HGEMM | 1512 / 2186 (+45 %) | 788 / 2298 (+192 %) | 1781 / 2524 (+42 %) | 2755 / 2640 (−4 %) |
+
+Winners: SGEMM MT128x128x8, HGEMM MT128x128x16 (TT8x8, PrefetchGlobalRead 1). The large gains are sizes where the
+current table picks a weak solution; at 4096³ rocBLAS is already level.
+
+**PyTorch fp16 path** (fp16 in/out, fp32 accumulation, TN; Whisper large-v3 encoder shapes): the best kernel is
+MT96x96x16 (TT6x6), 4–7 % faster than the current table inside rocBLAS (`rocblas-bench`, alternating runs) for 1280×1500×1280, 5120×1500×1280 and 1280×1500×5120. With fp32
+accumulation this chip tops out at ~1.5–1.6 TFLOPS (pure fp16: ~2.6). Added as an extra solution to the gfx90c
+`Alik_Bljk_HHS_BH` table and re-tuned PyTorch TunableOp for both libraries: Whisper large-v3-turbo encoder
+3072 → 2990 ms (−2.7 %), full transcription 3298 → 3218 ms (−2.4 %), identical output.
+
+**fp32 batched attention / demucs shapes:** the current selection is faster than every oto-style config tried (3–21 %).
+
+Lesson: adding a solution to a Tensile table shifts rocBLAS solution indices, so existing PyTorch TunableOp files pick
+wrong solutions afterwards (Whisper got 4 % *slower* until TunableOp was re-run). Regenerate TunableOp files after any
+library change.
+
+## Upstream status (26 Nov 2026)
 
 | Item | Status |
 |---|---|
@@ -98,7 +130,7 @@ only `amdgpu.ko` out of tree with the exact distribution sources and compiler. C
 | R1 + R1b | PR ROCm/rocm-systems#16218 (with hip-tests regression tests since 20 Nov) |
 | R4 | PR ROCm/rocm-libraries#16348 |
 | R2 | PR ROCm/rocm-libraries#16349 |
-| R3 | PR ROCm/rocm-libraries#16350; natively tuned gfx90c kernels from @Netherquark's [oto](https://github.com/Netherquark/oto) are planned to be added there (e.g. HGEMM MT128x128x16: ~2650 instead of ~1830 GFLOPS at 4096³ on a 5600G) |
+| R3 | PR ROCm/rocm-libraries#16350; natively tuned gfx90c kernels from @Netherquark's [oto](https://github.com/Netherquark/oto) are planned to be added there; oto configurations re-measured on a 5600G: big gains where the current selection has gaps, small gains on the PyTorch fp16 path ([below](#oto-kernels-re-measured-on-gfx90c-26-nov-2026)) |
 | L (Loom) | reported ROCm/hrx-system#3455, **fixed** by ROCm/hrx-system#3467 (merged 19 Nov), verified on gfx90c (see below) |
 | K (kernel) | reported in https://gitlab.freedesktop.org/drm/amd/-/issues/6177; at the maintainer's request submitted to amd-gfx on 20 Nov 2026 as a 2-patch series; following review, squashed into one patch for all gfx9 APUs and **sent as v2 on 21 Nov 2026**: "[PATCH v2] drm/amdgpu/gfx9: deactivate all compute HQDs before MODE2 on APUs" (signed off by me, Assisted-by tag; patch in `patches/linux/v2/`); **reviewed and applied** by Alex Deucher on 23 Nov 2026 (https://lore.kernel.org/amd-gfx/CADnq5_MjcV0Zg1a=ud0rTmdfmPueu9aokn_fewgU47104UJwJg@mail.gmail.com/), in amd-staging-drm-next as aecf8b416, drm/amd#6177 closed on 25 Nov |
 | K – possibly related | drm/amd#6053 (same reset-domain trylock problem on gfx1103/MES, found by AMD) and ROCm/TheRock#8357 (Lucienne gfx90c: ROCm broken after the first reset) – both linked to #6177 |

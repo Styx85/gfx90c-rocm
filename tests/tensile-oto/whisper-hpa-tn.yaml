@@ -1,0 +1,55 @@
+GlobalParameters:
+  MinimumRequiredVersion: 4.0.0
+  NumElementsToValidate: 1000
+  ValidationMaxToPrint: 4
+  BoundsCheck: False
+  KernelTime: True
+  DataInitTypeAB: 3
+  DataInitTypeBeta: 0
+  NumBenchmarks: 5
+  SyncsPerBenchmark: 1
+  EnqueuesPerSync: 5
+  SleepPercent: 50
+  PrintSolutionRejectionReason: False
+  CMakeBuildType: Release
+  CpuThreads: 4
+  ShortNames: False
+  MergeFiles: True
+  Device: 0
+  HardwareMonitor: False
+
+BenchmarkProblems:
+  - # Whisper large-v3 encoder: fp16 with fp32 accumulation (as PyTorch / rocblas_gemm_ex), TN
+    - OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+      ForkParameters:
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ThreadTile: [[8, 8], [6, 6]]
+        - WorkGroup: [[16, 16, 1]]
+        - DepthU: [8, 16, 32]
+        - VectorWidth: [-1]
+        - GlobalReadVectorWidth: [-1]
+        - NumLoadsCoalescedA: [1, 2]
+        - NumLoadsCoalescedB: [1, 2]
+        - WorkGroupMapping: [8]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 1500, 1, 1280]
+          - Exact: [5120, 1500, 1, 1280]
+          - Exact: [1280, 1500, 1, 5120]
