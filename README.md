@@ -17,7 +17,7 @@ Tested on: Ryzen 5 5600G (Vega 7, 7 CUs), DDR4-3200, Proxmox VE kernel 7.0.14, A
 | R1 | CLR (`rocclr/device/device.cpp`) | ISA table lists gfx902/909/90c as xnack `ANY`, ROCr reports them xnack-unsupported → assertion in `amd::Isa::isCompatible` for every HIP/OpenCL program | align the table with ROCr (`patches/rocm-systems`, commit 1) – overlaps with ROCm/rocm-systems#13903 |
 | R1b | HIP (`hip_fatbin.cpp`) | `gfx90c:xnack-` code objects in a fat binary are not found on an xnack-off agent (`hipErrorInvalidKernelFile`, silently wrong results in programs that don't check) | ask COMGR with the feature string (`patches/rocm-systems`, commit 2) |
 | R2 | rocBLAS/Tensile | no Tensile library for gfx90c and no fallback to `gfx9-generic` | exact arch → LLVM generic family fallback (`patches/rocm-libraries/*/0001`) |
-| R3 | rocBLAS | only the slow generic fallback kernels | gfx90c logic generated from vega10 (`make_gfx90c_logic.sh`), selection tables re-tuned on gfx90c (`0004`–`0006`) |
+| R3 | rocBLAS | only the slow generic fallback kernels | gfx90c logic generated from vega10 (`make_gfx90c_logic.sh`), selection tables re-tuned on gfx90c (`0004`–`0006`), plus one oto-derived HHS_BH solution (`0007`) |
 | R4 | Tensile | `ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH` / solution index → `internal_error` (code object of preloaded libraries never loaded) – architecture-independent | `patches/rocm-libraries/develop/0002` |
 | K | Linux amdgpu (GC 9.3.0) | after a GPU reset (MODE2) KFD is dead until reboot: the HIQ (and stuck HWS queues) stay active across MODE2 | deactivate all compute HQDs except the KIQ before MODE2 – `patches/linux/v2/` (one patch for all gfx9 APUs, as sent upstream; the older 2-patch series v1 is kept next to it); **applied upstream** by the amdgpu maintainer on 23 Nov 2026 (amd-staging-drm-next aecf8b416) |
 | C | llama.cpp HIP backend | GCN5 has no dot instructions; FA spills, slow mmvq decode | 11 patches (`patches/llama.cpp-hip`) |
@@ -42,9 +42,9 @@ Test programs and scripts for the GEMM check, the GPU reset test and the Vulkan/
 | SGEMM | 673 / 672 | 929 / 762 | 977 / 769 | 1396 / 748 |
 | HGEMM | 796 / 706 | 1494 / 816 | 1807 / 672 | 1834 / 1254 |
 
-Measured with `tests/hip/gemm.cpp`, which times only 5 iterations at n = 4096 right after a CPU-side result check, so the
-iGPU may still be clocking up: values at large n can be too low (re-measured 26 Nov: HGEMM 4096³ ~2800 GFLOPS in steady
-runs, with the vega10 and the re-tuned tables alike).
+Measured with an earlier `tests/hip/gemm.cpp` that timed only 5 iterations at n = 4096 right after a CPU-side result
+check, while the iGPU was still clocking up, so values at large n are too low. Fixed on 26 Nov (warm-up right before
+timing, ≥ 500 ms timed): HGEMM 4096³ now 2680–2820 GFLOPS in repeated runs, with the vega10 and the re-tuned tables alike.
 
 Re-tuned selection tables (R3): 3390 problem sizes, median 1.67× faster than the vega10 table choice (it picked tiny
 tiles because of nearest-neighbour matching on raw sizes).
@@ -113,7 +113,7 @@ current table picks a weak solution; at 4096³ rocBLAS is already level.
 **PyTorch fp16 path** (fp16 in/out, fp32 accumulation, TN; Whisper large-v3 encoder shapes): the best kernel is
 MT96x96x16 (TT6x6), 4–7 % faster than the current table inside rocBLAS (`rocblas-bench`, alternating runs) for 1280×1500×1280, 5120×1500×1280 and 1280×1500×5120. With fp32
 accumulation this chip tops out at ~1.5–1.6 TFLOPS (pure fp16: ~2.6). Added as an extra solution to the gfx90c
-`Alik_Bljk_HHS_BH` table and re-tuned PyTorch TunableOp for both libraries: Whisper large-v3-turbo encoder
+`Alik_Bljk_HHS_BH` table (patch `0007`, Styx85/rocm-libraries branch `gfx90c`) and re-tuned PyTorch TunableOp for both libraries: Whisper large-v3-turbo encoder
 3072 → 2990 ms (−2.7 %), full transcription 3298 → 3218 ms (−2.4 %), identical output.
 
 **fp32 batched attention / demucs shapes:** the current selection is faster than every oto-style config tried (3–21 %).

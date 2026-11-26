@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <rocblas/rocblas.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -39,7 +40,12 @@ template<class T> int test(rocblas_handle h,const char* name,int n,int reps,doub
   int bad=0; double maxerr=0; std::uniform_int_distribution<int> r(0,n-1);
   for(int s=0;s<2000;s++){int i=r(g),j=r(g); double ref=0,S=0; for(int k=0;k<n;k++){double p=(double)tof(A[i+(size_t)k*n])*tof(B[k+(size_t)j*n]); ref+=p; S+=fabs(p);}
     double e=fabs(tof(C[i+(size_t)j*n])-ref)/(u*sqrt((double)n)*S+u*fabs(ref)+1e-30); if(e>maxerr)maxerr=e; if(!(e<=4.0)) bad++;}
-  hipEvent_t e0,e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1)); CK(hipEventRecord(e0));
+  // The CPU check above leaves the iGPU idle and clocked down: warm up for >= 200 ms right before timing, then time
+  // enough iterations for >= 500 ms (a few iterations straight after the check caught the clock ramp-up).
+  hipEvent_t e0,e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1)); float wms=0; int w=0; CK(hipEventRecord(e0));
+  do{ CB(gemm(h,n,dA,dB,dC,1.f,0.f)); w++; CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1)); CK(hipEventElapsedTime(&wms,e0,e1)); }while(wms<200.f);
+  reps=std::max(reps,(int)std::ceil(500.0/(wms/w)));
+  CK(hipEventRecord(e0));
   for(int i=0;i<reps;i++) CB(gemm(h,n,dA,dB,dC,1.f,0.f));
   CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1)); float ms; CK(hipEventElapsedTime(&ms,e0,e1));
   double gf=2.0*n*n*(double)n*reps/(ms*1e6);
