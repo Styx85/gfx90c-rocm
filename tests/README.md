@@ -6,7 +6,7 @@ are from one machine (Ryzen 5 5600G, Vega 7, DDR4-3200, Proxmox VE kernel 7.0.14
 | Folder | What | Used for |
 |---|---|---|
 | `hip/` | `vadd.hip` (saxpy smoke test, checks every element), `gemm.cpp` (rocBLAS SGEMM/HGEMM vs. a double CPU reference + GFLOPS) | R1/R1b/R2/R3, before/after reset in K |
-| `kernel-reset/` | `reset-test.sh` (HIP + rocBLAS before and after a requested MODE2 reset), `halt.hip` and `halt-evict.hip` (provoke a real preemption failure → KFD-triggered reset) | patch K |
+| `kernel-reset/` | `reset-test.sh` (HIP + rocBLAS before and after a requested MODE2 reset), `halt.hip` and `halt-evict.hip` (provoke a real preemption failure → KFD-triggered reset); `reset-diagnose` + `gpu-regs.py` (one requested reset with tracefs kprobes, GC/CPF/RLC registers and all HQDs per phase via debugfs `amdgpu_regs`; host-specific: reset requested through a watchdog in an LXC container, comments in German) | patch K, drm/amd#6206 |
 | `loom-vulkan/` | `cts-run.sh` (every Loom/IREE Vulkan test on its own), `mesa-mr-round.sh` / `mesa-mr-own-base.sh` (Mesa MRs: suite + llama-bench per build), `ab-driver-builds.sh` (A/B of several builds of one Mesa tree) | M1, M2, Mesa MR testing |
 | `mesa-16891/` | `shared2run.c` + two compute shaders: reproducer for the `try_fold_shared2` assertion | mesa/mesa#16891, fix !46405 |
 | `tensile-oto/` | Tensile configs with oto-style kernels (SGEMM/HGEMM NN, PyTorch fp16-HPA TN Whisper shapes, fp32 attention) | R3, comparison with @Netherquark's oto |

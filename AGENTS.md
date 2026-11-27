@@ -7,7 +7,7 @@ Loom findings. Results and the upstream status table are in `README.md`.
 
 Keywords: ROCm, HIP, gfx90c, gfx902, gfx909, Vega iGPU, Renoir, Cezanne, Lucienne, Ryzen 5600G, APU, xnack, rocBLAS,
 Tensile, hipErrorInvalidKernelFile, amd::Isa::isCompatible assertion, KFD, HIQ, MODE2 reset, qcm fence wait loop
-timeout, amdgpu.noretry, sched_policy NO_HWS hard lock, PyTorch ROCm, TunableOp, llama.cpp HIP, Mesa RADV, ACO.
+timeout, amdgpu.noretry, sched_policy NO_HWS hard lock, CPF busy after MODE2 / GFX never idles after reset, PyTorch ROCm, TunableOp, llama.cpp HIP, Mesa RADV, ACO.
 
 ## Layout
 

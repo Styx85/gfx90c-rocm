@@ -1,0 +1,176 @@
+#!/bin/bash
+# pve: /usr/local/sbin/reset-diagnose – warum bleibt die iGPU nach einem MODE2-Reset (mit unserem Patch) bis zum Neustart
+# auf Höchsttakt / GPU Load 99 %? Ein angeforderter Reset, rundherum kprobes auf Rechen-Zähler, Energieprofil,
+# Power-Gating, GFXOFF, RLC-Safe-Mode und Reset-Pfad, dazu GC-Statusregister + HQDs (gpu-regs.py) und Leerlaufwerte
+# in jeder Phase. Danach Gegenproben (ki-hip aus/an, DPM low/auto, GFXOFF aus/an). Kein automatischer Neustart.
+# Ergebnis: /root/reset-diagnose/<Zeit>/ (zusammenfassung, phasen.txt, trace.txt), Handy-Meldung.
+set -u
+export LC_ALL=C
+T=/sys/kernel/tracing; G=rdiag
+O=/root/reset-diagnose/$(date +%Y%m%d-%H%M); mkdir -p "$O"; P=$O/phasen.txt
+C=$(ls -d /sys/class/drm/card*/device | while read -r c; do [ -e "$c/gpu_busy_percent" ] && echo "$c"; done | head -1)
+HW=$(for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name")" = amdgpu ] && echo "$h"; done | head -1)
+DD=$(dirname "$(ls /sys/kernel/debug/dri/*/amdgpu_gfxoff | head -1)")
+log() { echo "$(date '+%F %T') $*" | tee -a "$O/log"; }
+[ -n "$C" ] && [ -n "$HW" ] && [ -e "$DD/amdgpu_gfxoff" ] || { echo "GPU-Pfade nicht gefunden (C=$C HW=$HW DD=$DD)"; exit 1; }
+EVENTS="inc dec compute_idle dpm_profile smu_profile renoir_profile pg gfxoff rlc_enter rlc_exit recover kfd_pre_reset kfd_post_reset late_init dequeue_all gui_idle_int rlc_stop rlc_start rlc_resume gfx_hw_init gfx_hw_fini cp_compute_en cp_gfx_en gfx_cg dev_cg soc15_cg cgcg mgcg cp_pg"
+GFXOFF_GESPERRT=0; DPM_GESETZT=""; KI_HIP_GESTOPPT=0; RESET_OFFEN=0; PROBES=0
+BUF_VORHER=$(cat "$T/buffer_size_kb" 2>/dev/null | grep -oE '^[0-9]+' || echo 1408)
+gfxoff_sperren() { printf '\0\0\0\0' >"$DD/amdgpu_gfxoff" && GFXOFF_GESPERRT=1; }
+gfxoff_freigeben() { [ "$GFXOFF_GESPERRT" = 1 ] && printf '\1\0\0\0' >"$DD/amdgpu_gfxoff" && GFXOFF_GESPERRT=0; }
+melden() { /usr/local/sbin/gpu-melden.sh "$1" "$2" >/dev/null 2>&1 || true; }
+marke() { echo "=== PHASE $1" >"$T/trace_marker" 2>/dev/null || true; }
+
+kprobes_weg() { # einzeln entfernen (ein fehlschlagender Eintrag stoppt sonst den Rest)
+  local e
+  for e in $EVENTS; do
+    [ -e "$T/events/$G/$e" ] || continue
+    echo 0 >"$T/events/$G/$e/enable" 2>/dev/null
+    echo '!stacktrace' >"$T/events/$G/$e/trigger" 2>/dev/null
+    echo "-:$G/$e" >>"$T/kprobe_events" 2>/dev/null
+  done; }
+
+kprobes_an() {
+  kprobes_weg   # Reste eines abgebrochenen Laufs
+  echo 0 >"$T/tracing_on"; echo >"$T/trace"; echo 4096 >"$T/buffer_size_kb"
+  local d
+  for d in \
+    "p:$G/inc kfd_inc_compute_active" \
+    "p:$G/dec kfd_dec_compute_active" \
+    "p:$G/compute_idle amdgpu_amdkfd_set_compute_idle idle=%si:u8" \
+    "p:$G/dpm_profile amdgpu_dpm_switch_power_profile type=%si:u32 en=%dx:u8" \
+    "p:$G/smu_profile smu_switch_power_profile type=%si:u32 en=%dx:u8" \
+    "p:$G/renoir_profile renoir_set_power_profile_mode mask=%si:u32" \
+    "p:$G/pg gfx_v9_0_set_powergating_state state=%si:u32" \
+    "p:$G/gfxoff amdgpu_gfx_off_ctrl enable=%si:u8" \
+    "p:$G/rlc_enter amdgpu_gfx_rlc_enter_safe_mode" \
+    "p:$G/rlc_exit amdgpu_gfx_rlc_exit_safe_mode" \
+    "p:$G/recover amdgpu_device_gpu_recover" \
+    "p:$G/kfd_pre_reset kgd2kfd_pre_reset" \
+    "p:$G/kfd_post_reset kgd2kfd_post_reset" \
+    "p:$G/late_init amdgpu_device_ip_late_init" \
+    "p:$G/dequeue_all kfd_process_dequeue_from_all_devices" \
+    "p:$G/gui_idle_int gfx_v9_0_enable_gui_idle_interrupt enable=%si:u8" \
+    "p:$G/rlc_stop gfx_v9_0_rlc_stop" \
+    "p:$G/rlc_start gfx_v9_0_rlc_start" \
+    "p:$G/rlc_resume gfx_v9_0_rlc_resume" \
+    "p:$G/gfx_hw_init gfx_v9_0_hw_init" \
+    "p:$G/gfx_hw_fini gfx_v9_0_hw_fini" \
+    "p:$G/cp_compute_en gfx_v9_0_cp_compute_enable enable=%si:u8" \
+    "p:$G/cp_gfx_en gfx_v9_0_cp_gfx_enable enable=%si:u8" \
+    "p:$G/gfx_cg gfx_v9_0_set_clockgating_state state=%si:u32" \
+    "p:$G/dev_cg amdgpu_device_set_cg_state state=%si:u32" \
+    "p:$G/soc15_cg soc15_common_set_clockgating_state state=%si:u32" \
+    "p:$G/cgcg gfx_v9_0_update_coarse_grain_clock_gating enable=%si:u8" \
+    "p:$G/mgcg gfx_v9_0_update_medium_grain_clock_gating enable=%si:u8" \
+    "p:$G/cp_pg gfx_v9_0_enable_cp_power_gating enable=%si:u8"; do
+    echo "$d" >>"$T/kprobe_events" 2>>"$O/log" || log "kprobe nicht gesetzt: $d"
+  done
+  PROBES=1
+  for d in inc dec compute_idle pg gui_idle_int gfx_cg cgcg rlc_stop; do
+    [ -e "$T/events/$G/$d" ] && echo stacktrace >"$T/events/$G/$d/trigger" 2>/dev/null
+  done
+  echo 1 >"$T/events/$G/enable"
+  echo 'func gfx_v9_0_deactivate_all_hqd +p' >/proc/dynamic_debug/control 2>/dev/null || true
+  echo 1 >"$T/tracing_on"; }
+
+kprobes_aus() {
+  [ "$PROBES" = 1 ] || return 0
+  echo 0 >"$T/tracing_on"; cp "$T/trace" "$O/trace.txt"
+  kprobes_weg; PROBES=0
+  echo 'func gfx_v9_0_deactivate_all_hqd -p' >/proc/dynamic_debug/control 2>/dev/null || true
+  echo "$BUF_VORHER" >"$T/buffer_size_kb" 2>/dev/null; echo 1 >"$T/tracing_on"; }
+
+aufraeumen() { # auch bei Abbruch: nichts Erzwungenes zurücklassen
+  gfxoff_freigeben
+  [ -n "$DPM_GESETZT" ] && echo "$DPM_GESETZT" >"$C/power_dpm_force_performance_level" 2>/dev/null
+  [ "$KI_HIP_GESTOPPT" = 1 ] && pct exec 118 -- systemctl start ki-hip-immich
+  [ "$RESET_OFFEN" = 1 ] && pct exec 118 -- rm -f /root/rocm/GPU-RESET-ANGEFORDERT
+  kprobes_aus
+  /usr/local/sbin/speicherwaechter frei reset-diagnose >/dev/null 2>&1; }
+
+schnappschuss() { # $1 Phase – 10 Proben à 2 s + Register
+  local i b s w t bs=()
+  marke "$1"
+  for i in $(seq 10); do
+    b=$(cat "$C/gpu_busy_percent"); s=$(awk '/\*/{print $2}' "$C/pp_dpm_sclk")
+    w=$(awk '{printf "%.0f", $1/1e6}' "$HW/power1_input" 2>/dev/null); t=$(awk '{printf "%.0f", $1/1000}' "$HW/temp1_input")
+    bs+=("$b/$s/${w}W/${t}C"); sleep 2
+  done
+  {
+    echo "=== $1 ($(date +%T))"
+    echo "proben: ${bs[*]}"
+    echo "kfd: $(for p in /sys/class/kfd/kfd/proc/*; do [ -e "$p" ] && echo -n "$(cat /proc/${p##*/}/comm 2>/dev/null)[${p##*/}] "; done)"
+    echo "gfxoff_status=$(od -An -tu4 -N4 "$DD/amdgpu_gfxoff_status" 2>/dev/null | tr -d ' ') dpm=$(cat "$C/power_dpm_force_performance_level")"
+    marke "$1 register (GFXOFF kurz gesperrt)"; gfxoff_sperren; sleep 0.5
+    /usr/local/sbin/gpu-regs.py 2>&1; gfxoff_freigeben; marke "$1 register fertig"
+    echo
+  } >>"$P"
+  log "Phase $1: ${bs[0]} … ${bs[9]}"; }
+
+warte_ki_hip() { local n; for n in $(seq 60); do pct exec 118 -- systemctl is-active -q ki-hip-immich && return 0; sleep 5; done; return 1; }
+
+# --- Ablauf
+log "Start (Kernel $(uname -r), Modul $(cat /sys/module/amdgpu/srcversion))"
+trap aufraeumen EXIT
+/usr/local/sbin/speicherwaechter vorrang reset-diagnose 45 >/dev/null 2>&1
+sleep 90
+kprobes_an
+schnappschuss 1-vorher
+
+marke reset-anforderung
+seit=$(date '+%F %T')
+RESET_OFFEN=1
+pct exec 118 -- sh -c 'echo "reset-diagnose: Höchsttakt nach MODE2 untersuchen" > /root/rocm/GPU-RESET-ANGEFORDERT'
+for _ in $(seq 60); do journalctl -k --since "$seit" --no-pager | grep -qE "GPU reset\(.*\) (succeeded|failed)|reset failed" && break; sleep 3; done
+journalctl -k --since "$seit" --no-pager | grep -iE "amdgpu|kfd" >"$O/kernel.txt"
+grep -qE "GPU reset\(.*\) succeeded" "$O/kernel.txt" || { log "Reset nicht erfolgreich/nicht gesehen – Abbruch"; melden "reset-diagnose abgebrochen" "Reset nicht erfolgreich, siehe $O"; exit 1; }
+RESET_OFFEN=0
+sleep 5
+schnappschuss 2-direkt-nach-reset
+
+for _ in $(seq 72); do pct exec 118 -- sh -c 'test ! -e /root/rocm/GPU-GESPERRT' && break; sleep 5; done
+warte_ki_hip || log "ki-hip nicht aktiv"
+sleep 30
+schnappschuss 3-nach-freigabe
+
+marke ki-hip-stopp; KI_HIP_GESTOPPT=1; pct exec 118 -- systemctl stop ki-hip-immich; sleep 15
+schnappschuss 4-ohne-kfd-prozess
+marke ki-hip-start; pct exec 118 -- systemctl start ki-hip-immich; KI_HIP_GESTOPPT=0; warte_ki_hip; sleep 30
+schnappschuss 5-ki-hip-neu
+
+DPM_VORHER=$(cat "$C/power_dpm_force_performance_level")
+marke dpm-low; DPM_GESETZT=$DPM_VORHER; echo low >"$C/power_dpm_force_performance_level"; sleep 5
+schnappschuss 6-dpm-low
+marke dpm-zurueck; echo "$DPM_VORHER" >"$C/power_dpm_force_performance_level"; DPM_GESETZT=""; sleep 5
+schnappschuss 7-dpm-zurueck
+
+marke gfxoff-aus-an; gfxoff_sperren; sleep 3; gfxoff_freigeben; sleep 5
+schnappschuss 8-nach-gfxoff-umschalten
+
+# Gegenprobe Leerlauf-Interrupts: CP_INT_CNTL_RING0 wie vor dem Reset setzen, falls abweichend (Neustart folgt ohnehin)
+civ=$(awk '/^=== /{f=($2 ~ /^1-vorher/)} f && /CP_INT_CNTL_RING0=/{match($0,/CP_INT_CNTL_RING0=0x[0-9a-f]+/); print substr($0,RSTART+18,RLENGTH-18); exit}' "$P")
+cin=$(awk '/^=== /{f=($2 ~ /^8-/)} f && /CP_INT_CNTL_RING0=/{match($0,/CP_INT_CNTL_RING0=0x[0-9a-f]+/); print substr($0,RSTART+18,RLENGTH-18); exit}' "$P")
+log "CP_INT_CNTL_RING0 vorher=$civ jetzt=$cin"
+if [ -n "$civ" ] && [ -n "$cin" ] && [ "$civ" != "$cin" ]; then
+  marke cp-int-setzen; gfxoff_sperren; /usr/local/sbin/gpu-regs.py --setze CP_INT_CNTL_RING0 "$civ" >>"$O/log" 2>&1; gfxoff_freigeben; sleep 10
+  schnappschuss 9-cp-int-wie-vorher
+else
+  log "CP_INT_CNTL_RING0 unverändert – keine Gegenprobe"
+fi
+
+trap - EXIT; aufraeumen
+journalctl -k --since "$seit" --no-pager | grep -iE "amdgpu|kfd" >"$O/kernel.txt"
+
+# Zusammenfassung: Busy je Phase, Zählerbilanz inc/dec, letzte Profil-/PG-/GFXOFF-Aufrufe
+{
+  echo "reset-diagnose $(date '+%F %T'), Kernel $(uname -r)"
+  awk '/^=== /{ph=$2} /^proben:/{n=split($0,a," "); split(a[2],x,"/"); split(a[n],y,"/"); printf "%-28s erste %s/%s letzte %s/%s\n", ph, x[1], x[2], y[1], y[2]} /^aktive HQDs/{print "   " $0} /CP_CPC_BUSY_STAT/{for(i=1;i<=NF;i++) if($i ~ /^(GRBM_STATUS|GRBM_STATUS2|CP_CPC_BUSY_STAT|CP_STAT|RLC_SAFE_MODE|RLC_GPM_STAT|RLC_CGCG_CGLS_CTRL|CP_CPF_STATUS|CP_CPF_BUSY_STAT|CP_CPF_STALLED_STAT1|CP_STALLED_STAT1|CP_STALLED_STAT2|CP_STALLED_STAT3|CPC_UTCL1_STATUS|CPF_UTCL1_STATUS|CPG_UTCL1_STATUS|VM_L2_PROTECTION_FAULT_STATUS)=/) printf "   %s", $i; print ""}' "$P"
+  ev=$(echo $EVENTS | tr ' ' '|')
+  echo "kprobe-Zählung: $(grep -oE " ($ev): \(" "$O/trace.txt" | tr -d ' :(' | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')"
+  echo "inc-dec-Bilanz gesamt: $(( $(grep -c ' inc: (' "$O/trace.txt") - $(grep -c ' dec: (' "$O/trace.txt") ))"
+  echo "Hinweis: Register-Lesen sperrt GFXOFF kurz (zwischen Markern „register“) – diese gfxoff-Aufrufe sind gewollt."
+} >"$O/zusammenfassung"
+cat "$O/zusammenfassung" >>"$O/log"
+melden "reset-diagnose fertig" "$(head -c 900 "$O/zusammenfassung") … Details: $O"
+log "fertig: $O"
